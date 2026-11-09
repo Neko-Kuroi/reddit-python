@@ -10,7 +10,7 @@ import uuid
 import math
 from typing import ClassVar
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Integer, Float, UUID, ForeignKey, DateTime, func, text
+from sqlalchemy import String, Text, Integer, Float, UUID, ForeignKey, DateTime, Index, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base, TimestampMixin
@@ -68,9 +68,10 @@ class Post(Base, TimestampMixin):
 
     @staticmethod
     def compute_hot_score(score: int, inserted_at: datetime) -> float:
-        """Reddit オリジナルのアルゴリズムをシンプルにしたもの"""
+        """Reddit の Hot アルゴリズム（スコアの符号を保持する）"""
         epoch = datetime(2005, 12, 8, 7, 46, 43, tzinfo=timezone.utc)
-        order = math.log10(max(abs(score), 1))
+        sign = (score > 0) - (score < 0)
+        order = sign * math.log10(max(abs(score), 1))
         seconds = (inserted_at - epoch).total_seconds()
         return order + seconds / 45_000
 
@@ -92,6 +93,8 @@ votes: Mapped[list["Vote"]] = relationship(
 ```
 
 `viewonly=True` は読み取り専用のアソシエーションです。投票の追加・削除は直接 `Vote` モデルを操作します。
+
+`compute_hot_score` は、スコアの絶対値を `log10` で圧縮したものに、スコアの符号を掛けます。正のスコアでは大きさの分だけ上がり、負のスコアでは同じ大きさだけ下がります。そこへ投稿時刻を 45,000 秒（12.5時間）で割った値を足すため、同じスコアなら新しい投稿ほど上になります。符号を落とすと -50 と +50 が同じ土台になってしまうので、Reddit の「下げ票で沈む」挙動には符号が欠かせません。スコア 0 では符号も 0 になり、時刻の分だけで決まります。
 
 `comment_count` は DB のカラムではなく Python 側で後からセットするフィールドです。Elixir版の `virtual: true` フィールドに相当します。
 
@@ -246,6 +249,13 @@ parent: Mapped["Comment | None"] = relationship(
 
 class Vote(Base):
     __tablename__ = "votes"
+    __table_args__ = (
+        Index(
+            "ix_votes_unique",
+            "user_id", "target_type", "target_id",
+            unique=True
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -304,6 +314,8 @@ class Report(Base):
 `Report` モデルも他のモデルと同じく、ファイル先頭で必要な import をすべて書きます（`Base` や `Mapped` は import しなければ使えません）。
 
 報告理由の候補リスト（`VALID_REASONS`）はモデルには置きません。第4章の Reports Service 側に正本を1つだけ置き、モデル・テンプレートはそちらを参照する形にします（同じリストを複数箇所に書くと、変更したときの同期漏れが起きるためです）。
+
+`Vote.__table_args__` の一意インデックスは、第2章のマイグレーションにある `ix_votes_unique` と同じものです。「同じユーザーが、同じ対象へは1票だけ」という決まりを DB 自身にも持たせることで、Service が存在確認をしてから保存する間に別のリクエストが割り込んでも、二重の票を保存できません。第4章では、その違反を Service が受け取り、500 にせず現在の状態を返す形にします。
 
 なお、この節の `Vote` は、3-7 で作った `app/posts/models.py` の末尾への **追加** です。`Post` と `Vote` を合わせたファイルの完成形は、全コード付録 2 に収録しています。
 

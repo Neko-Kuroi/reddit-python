@@ -2,6 +2,7 @@
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, exists, and_
+from sqlalchemy.exc import IntegrityError
 
 from app.communities.models import Subreddit, SubredditMember
 from app.communities.schemas import SubredditCreate
@@ -18,31 +19,39 @@ async def create_subreddit(
     作成者を moderator として自動的に登録する。
     トランザクションで両方の操作を保護する。
     """
+    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+    name = data.name.lower()
+
     # 名前の重複チェック
     existing = await db.execute(
-        select(Subreddit).where(Subreddit.name == data.name)
+        select(Subreddit).where(Subreddit.name == name)
     )
     if existing.scalar_one_or_none():
-        raise ValueError(f"r/{data.name} はすでに存在します")
+        raise ValueError(f"r/{name} はすでに存在します")
 
     # Subreddit を作成
     subreddit = Subreddit(
-        name=data.name,
+        name=name,
         description=data.description,
         owner_id=owner_id
     )
     db.add(subreddit)
-    await db.flush()   # subreddit.id を確定させる
+    try:
+        await db.flush()   # subreddit.id を確定させる
 
-    # 作成者を moderator として登録
-    member = SubredditMember(
-        user_id=owner_id,
-        subreddit_id=subreddit.id,
-        role="moderator"
-    )
-    db.add(member)
-    await db.flush()
-    await db.refresh(subreddit)
+        # 作成者を moderator として登録
+        member = SubredditMember(
+            user_id=owner_id,
+            subreddit_id=subreddit.id,
+            role="moderator"
+        )
+        db.add(member)
+        await db.flush()
+        await db.refresh(subreddit)
+    except IntegrityError:
+        # 重複チェック後に別のリクエストが先に作成した場合は重複として返す
+        await db.rollback()
+        raise ValueError(f"r/{name} はすでに存在します")
 
     return subreddit
 
@@ -55,7 +64,7 @@ async def get_subreddit_by_name(
     db: AsyncSession, name: str
 ) -> Subreddit | None:
     result = await db.execute(
-        select(Subreddit).where(Subreddit.name == name)
+        select(Subreddit).where(Subreddit.name == name.lower())
     )
     return result.scalar_one_or_none()
 

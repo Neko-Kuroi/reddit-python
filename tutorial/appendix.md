@@ -88,6 +88,7 @@ reddit_clone/
 │       └─ report_reasons.html        ← 報告理由の再表示用（第7章）
 │
 └─ static/
+    ├─ .gitkeep                       ← Git で空の static/ を残すための目印（第1章）
     └─ css/                           ← 本書では使いません（CSS は CDN の Tailwind を使用）
 ```
 
@@ -231,9 +232,9 @@ reddit_clone/
 |------|------|-------------------|
 | `create_post(db, data, author_id, subreddit_id)` | 投稿を作成する | `create_post/1` |
 | `get_post(db, post_id)` | id で投稿を取得する（無ければ `None`） | `get_post/1` |
-| `list_posts(db, subreddit_id, sort, page)` | コミュニティの投稿一覧を取得する（コメント数付き） | `list_posts/3` |
-| `list_home_posts(db, user_id, sort, page)` | ホーム Feed の投稿一覧を取得する | `list_home_posts/3` |
-| `list_user_posts(db, user_id, page)` | ユーザーの投稿一覧を取得する（プロフィール用） | `list_user_posts/2` |
+| `list_posts(db, subreddit_id, sort, page)` | コミュニティの投稿一覧と次ページの有無を取得する（コメント数付き） | `list_posts/3` |
+| `list_home_posts(db, user_id, sort, page)` | ホーム Feed の投稿一覧と次ページの有無を取得する | `list_home_posts/3` |
+| `list_user_posts(db, user_id, sort, page)` | ユーザーの投稿一覧と次ページの有無を取得する（プロフィール用） | `list_user_posts/2` |
 | `search_posts(db, query)` | キーワードで投稿を検索する | `search_posts/1` |
 | `vote_post(db, user_id, post_id, value)` | 投稿に投票する（4つのパターンを処理する） | `vote_post/3` |
 | `delete_post(db, post_id, user_id, subreddit_id)` | 投稿を削除する | `delete_post/3` |

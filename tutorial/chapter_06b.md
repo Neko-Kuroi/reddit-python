@@ -6,7 +6,9 @@
 
 ```python
 # app/posts/router.py
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, Form, HTTPException
+from typing import Literal
+from html import escape
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -142,7 +144,7 @@ async def vote_post(
     except ValueError as e:
         # 自分の投稿への投票など
         return HTMLResponse(
-            content=f'<span class="text-red-500 text-xs">{str(e)}</span>',
+            content=f'<span class="text-red-500 text-xs">{escape(str(e))}</span>',
             status_code=400
         )
 
@@ -190,14 +192,16 @@ async def delete_post(
 @router.get("/", response_class=HTMLResponse)
 async def home(
     request: Request,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(require_auth),
     db: AsyncSession = Depends(get_db)
 ):
     from app.communities.services import list_joined_subreddits
 
-    posts = await services.list_home_posts(db, current_user.id, sort, page)
+    posts, has_more = await services.list_home_posts(
+        db, current_user.id, sort, page
+    )
     joined_subreddits = await list_joined_subreddits(db, current_user.id)
 
     return templates.TemplateResponse(
@@ -208,7 +212,7 @@ async def home(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "joined_subreddits": joined_subreddits
         }
     )
@@ -247,6 +251,8 @@ async def search(
 ルートの定義順について。FastAPI（Starlette）はルートを**定義した順**に照合します。`GET /r/{name}/submit` と `GET /r/{name}/{post_id}` では、`submit` が `{post_id}` にもマッチしてしまうため、**`/submit` 側を先に定義**しないと投稿作成ページが詳細ページとして解釈され、422 エラーになります。この Router では Subreddit 表示 → 投稿作成（submit）→ 投稿詳細、の順に並べてあります。
 
 投稿詳細ページの描画では、使わない変数（以前あった `reply_to` など）は渡しません。渡した値がテンプレートで使われない「死に変数」は、読み手の混乱の元になるためです。
+
+ホーム Feed でも、一覧の入口は Communities Router と同じ検証を使います。`sort` は `hot` と `new` だけ、`page` は1以上だけを受け付け、Service から返る `has_more` をそのままテンプレートへ渡します。投票エラーを部分 HTML として返すときは、例外文字列を `html.escape` してから埋め込みます。将来エラーメッセージに利用者の入力が混ざっても、タグとして解釈されないためです。
 
 **この時点での注意（ホーム Feed のテンプレートは第7章で作成）**
 

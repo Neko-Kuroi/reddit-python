@@ -9,6 +9,7 @@
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, and_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.comments.models import Comment
@@ -148,6 +149,22 @@ async def vote_comment(
             target_id=comment_id,
             value=value
         ))
+        try:
+            await db.flush()   # 一意制約の競合はここで検出する
+        except IntegrityError as e:
+            if not _is_vote_unique_violation(e):
+                raise
+            # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+            await db.rollback()
+            current_result = await db.execute(
+                select(Comment)
+                .where(Comment.id == comment_id)
+                .options(selectinload(Comment.author))
+            )
+            current_comment = current_result.scalar_one_or_none()
+            if current_comment is None:
+                raise ValueError("コメントが見つかりません")
+            return current_comment
         await _update_comment_score(db, comment, value)
         await update_karma(db, comment.author_id, "comment", value)
 
@@ -169,16 +186,24 @@ async def vote_comment(
     return comment
 
 
+def _is_vote_unique_violation(error: IntegrityError) -> bool:
+    original = getattr(error, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint = getattr(diagnostic, "constraint_name", None)
+    return constraint == "ix_votes_unique" or "ix_votes_unique" in str(original)
+
+
 async def _update_comment_score(
     db: AsyncSession, comment: Comment, diff: int
 ) -> None:
-    new_score = comment.score + diff
-    await db.execute(
+    # score は DB 側で差分加算し、同時投票でも更新を失わない
+    result = await db.execute(
         update(Comment)
         .where(Comment.id == comment.id)
-        .values(score=new_score)
+        .values(score=Comment.score + diff)
+        .returning(Comment.score)
     )
-    comment.score = new_score
+    comment.score = result.scalar_one()
 
 
 # ----------------------------------------------------------------
@@ -238,6 +263,8 @@ def _build_tree(comments):
 再帰で大切なのは「終わりの条件」です。ここでは `by_parent` にキーが無い（＝子が無い）ときに空のリストが返り、そこで掘り下げるのが止まります。トップレベルは `parent_id` が `None` のグループなので、開始点は `build_children(None)` です。
 
 もう1つ、この設計の肝は「DB への問い合わせは最初の1回だけ」という点です。コメントごとに「その子はどれか」を DB へ聞きに行くと、コメントの数だけクエリが増えてしまいます（中編の N+1 の話と同じです）。先に全件を取ってメモリ上で組み立てることで、コメントが何件でもクエリは1回で済みます。`children` は DB のカラムではなく、この組み立てのときにインスタンスへ付ける属性です（第3章の `comment_count` と同じ扱い）。
+
+コメント投票も投稿投票と同じ順序で競合に備えます。新しい票は先に `flush` して一意インデックスで重なりを判定し、並行した同じ票の片方はスコアを加算せず現在のコメントを返します。スコアそのものは `Comment.score + diff` と DB 側で差分加算するため、別々の利用者が同時に投票しても更新が失われません。
 
 ---
 

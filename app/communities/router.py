@@ -1,5 +1,6 @@
 # app/communities/router.py
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, Form, HTTPException
+from typing import Literal
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,8 +23,8 @@ router = APIRouter()
 async def subreddit_page(
     request: Request,
     name: str,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -31,7 +32,7 @@ async def subreddit_page(
     if subreddit is None:
         raise HTTPException(status_code=404, detail=f"r/{name} は存在しません")
 
-    posts = await list_posts(db, subreddit.id, sort, page)
+    posts, has_more = await list_posts(db, subreddit.id, sort, page)
     joined = False
     if current_user:
         joined = await services.is_member(db, current_user.id, subreddit.id)
@@ -45,7 +46,7 @@ async def subreddit_page(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "joined": joined
         }
     )
@@ -59,8 +60,8 @@ async def subreddit_page(
 async def load_more_posts(
     request: Request,
     name: str,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -69,7 +70,7 @@ async def load_more_posts(
     if subreddit is None:
         raise HTTPException(status_code=404)
 
-    posts = await list_posts(db, subreddit.id, sort, page)
+    posts, has_more = await list_posts(db, subreddit.id, sort, page)
 
     return templates.TemplateResponse(
         "components/post_list.html",
@@ -79,7 +80,7 @@ async def load_more_posts(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "subreddit": subreddit
         }
     )

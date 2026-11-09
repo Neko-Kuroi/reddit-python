@@ -7,6 +7,7 @@
 ```python
 # app/comments/router.py
 from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from html import escape
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -80,7 +81,7 @@ async def vote_comment(
         comment = await services.vote_comment(db, current_user.id, comment_id, value)
     except ValueError as e:
         return HTMLResponse(
-            content=f'<span class="text-red-500 text-xs">{str(e)}</span>',
+            content=f'<span class="text-red-500 text-xs">{escape(str(e))}</span>',
             status_code=400
         )
 
@@ -159,7 +160,7 @@ async def create_report(
         )
     except ValueError as e:
         return HTMLResponse(
-            content=f'<p class="text-red-500 text-sm">{str(e)}</p>',
+            content=f'<p class="text-red-500 text-sm">{escape(str(e))}</p>',
             status_code=400
         )
 
@@ -168,6 +169,10 @@ async def create_report(
         content='<p class="text-green-600 text-sm text-center py-2">報告しました。ご協力ありがとうございます。</p>'
     )
 ```
+
+**読み解き**
+
+この Router が返すエラーは、ページ全体ではなく HTMX が差し替える小さな HTML です。そのため、例外メッセージを文字列のまま埋め込むと、メッセージに含まれる利用者の入力まで HTML として解釈されてしまいます。特に報告理由は利用者が自由に送れる値で、Service の「無効な報告理由です」というエラーにもそのまま入ります。投票と報告のどちらのエラーも `html.escape(str(e))` を通し、`<` や `>` を文字として表示する形にそろえます。
 
 ---
 

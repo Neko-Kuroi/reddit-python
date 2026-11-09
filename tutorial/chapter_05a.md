@@ -211,7 +211,8 @@ async def redirect_if_authenticated(
 
 ```python
 # app/accounts/router.py
-from fastapi import APIRouter, Depends, Request, Response, Form
+from fastapi import APIRouter, Depends, Query, Request, Response, Form
+from typing import Literal
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -350,6 +351,8 @@ async def logout():
 async def profile(
     request: Request,
     username: str,
+    sort: Literal["hot", "new"] = Query("new"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -361,7 +364,9 @@ async def profile(
             "404.html", {"request": request}, status_code=404
         )
 
-    posts = await list_user_posts(db, profile_user.id)
+    posts, has_more = await list_user_posts(
+        db, profile_user.id, sort, page
+    )
 
     return templates.TemplateResponse(
         "accounts/profile.html",
@@ -369,7 +374,10 @@ async def profile(
             "request": request,
             "current_user": current_user,
             "profile_user": profile_user,
-            "posts": posts
+            "posts": posts,
+            "sort": sort,
+            "page": page,
+            "has_more": has_more
         }
     )
 ```
@@ -384,6 +392,8 @@ page: int = Form(1)         # デフォルト値あり（任意）
 ```
 
 ログイン失敗時のエラーメッセージは「メールアドレスまたはパスワードが違います」のみです。「メールが存在しません」と「パスワードが違います」を分けて伝えると、攻撃者がどのメールが登録済みかを判断できてしまいます。
+
+プロフィールの投稿一覧では `sort` と `page` を受け取ります。従来の表示順を保つため並び方の既定は `new` とし、許可する値は `hot` と `new` だけです。`page` は `Query(1, ge=1)` で 1 以上だけを許可します。不正な並び方や `page=0` のような値は Service に届く前に 422 になります。Service からは表示する投稿と `has_more` の組が返ります。
 
 `status_code=303` は POST 後のリダイレクトで使います。`303 See Other` はブラウザに「次は GET で取得してください」と伝えます。これにより、ページをリロードしたときにフォームが再送信されることを防ぎます（PRG パターン）。
 

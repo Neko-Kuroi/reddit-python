@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.posts.models import Post, Vote
@@ -62,8 +63,8 @@ async def get_post(db: AsyncSession, post_id: uuid.UUID) -> Post | None:
 async def list_posts(
     db: AsyncSession, subreddit_id: uuid.UUID,
     sort: str = "hot", page: int = 1
-) -> list[Post]:
-    """Subreddit の投稿一覧（コメント数付き）"""
+) -> tuple[list[Post], bool]:
+    """Subreddit の投稿一覧（コメント数付き）と次ページの有無"""
     from app.comments.models import Comment
 
     offset = (page - 1) * PAGE_SIZE
@@ -74,7 +75,7 @@ async def list_posts(
         .where(Post.subreddit_id == subreddit_id)
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .limit(PAGE_SIZE)
+        .limit(PAGE_SIZE + 1)
         .offset(offset)
     )
     query = _apply_sort(query, sort)
@@ -82,18 +83,19 @@ async def list_posts(
     result = await db.execute(query)
     rows = result.all()
 
+    has_more = len(rows) > PAGE_SIZE
     posts = []
-    for post, comment_count in rows:
+    for post, comment_count in rows[:PAGE_SIZE]:
         post.comment_count = comment_count
         posts.append(post)
-    return posts
+    return posts, has_more
 
 
 async def list_home_posts(
     db: AsyncSession, user_id: uuid.UUID,
     sort: str = "hot", page: int = 1
-) -> list[Post]:
-    """ホーム Feed（Join 済みの投稿一覧）"""
+) -> tuple[list[Post], bool]:
+    """ホーム Feed（Join 済みの投稿一覧）と次ページの有無"""
     from app.comments.models import Comment
 
     offset = (page - 1) * PAGE_SIZE
@@ -105,7 +107,7 @@ async def list_home_posts(
         .where(SubredditMember.user_id == user_id)
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .limit(PAGE_SIZE)
+        .limit(PAGE_SIZE + 1)
         .offset(offset)
     )
     query = _apply_sort(query, sort)
@@ -113,38 +115,43 @@ async def list_home_posts(
     result = await db.execute(query)
     rows = result.all()
 
+    has_more = len(rows) > PAGE_SIZE
     posts = []
-    for post, comment_count in rows:
+    for post, comment_count in rows[:PAGE_SIZE]:
         post.comment_count = comment_count
         posts.append(post)
-    return posts
+    return posts, has_more
 
 
 async def list_user_posts(
-    db: AsyncSession, user_id: uuid.UUID, page: int = 1
-) -> list[Post]:
-    """ユーザーの投稿一覧（プロフィールページ用）"""
+    db: AsyncSession, user_id: uuid.UUID,
+    sort: str = "new", page: int = 1
+) -> tuple[list[Post], bool]:
+    """ユーザーの投稿一覧（プロフィールページ用）と次ページの有無"""
     from app.comments.models import Comment
 
     offset = (page - 1) * PAGE_SIZE
 
-    result = await db.execute(
+    query = (
         select(Post, func.count(Comment.id).label("comment_count"))
         .outerjoin(Comment, Comment.post_id == Post.id)
         .where(Post.author_id == user_id)
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .order_by(Post.inserted_at.desc())
-        .limit(PAGE_SIZE)
+        .limit(PAGE_SIZE + 1)
         .offset(offset)
     )
+    query = _apply_sort(query, sort)
+
+    result = await db.execute(query)
     rows = result.all()
 
+    has_more = len(rows) > PAGE_SIZE
     posts = []
-    for post, comment_count in rows:
+    for post, comment_count in rows[:PAGE_SIZE]:
         post.comment_count = comment_count
         posts.append(post)
-    return posts
+    return posts, has_more
 
 
 async def search_posts(db: AsyncSession, query: str) -> list[Post]:
@@ -160,7 +167,7 @@ async def search_posts(db: AsyncSession, query: str) -> list[Post]:
         .where(Post.title.ilike(term))
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .order_by(Post.hot_score.desc())
+        .order_by(Post.hot_score.desc(), Post.id.desc())
         .limit(25)
     )
     rows = result.all()
@@ -174,8 +181,8 @@ async def search_posts(db: AsyncSession, query: str) -> list[Post]:
 
 def _apply_sort(query, sort: str):
     if sort == "new":
-        return query.order_by(Post.inserted_at.desc())
-    return query.order_by(Post.hot_score.desc())   # デフォルトは hot
+        return query.order_by(Post.inserted_at.desc(), Post.id.desc())
+    return query.order_by(Post.hot_score.desc(), Post.id.desc())
 
 
 # ----------------------------------------------------------------
@@ -210,7 +217,18 @@ async def vote_post(
 
     if existing_vote is None:
         # パターンA: 新規投票
-        await _create_vote(db, user_id, "post", post_id, value)
+        try:
+            await _create_vote(db, user_id, "post", post_id, value)
+        except IntegrityError as e:
+            if not _is_vote_unique_violation(e):
+                raise
+            # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+            # スコアを二重に加算せず、現在の投稿をそのまま返す。
+            await db.rollback()
+            current_post = await get_post(db, post_id)
+            if current_post is None:
+                raise ValueError("投稿が見つかりません")
+            return current_post
         await _update_post_score(db, post, value)
         await update_karma(db, post.author_id, "post", value)
 
@@ -259,23 +277,41 @@ async def _create_vote(
         value=value
     )
     db.add(vote)
+    await db.flush()   # 一意制約の競合はここで検出する
     return vote
+
+
+def _is_vote_unique_violation(error: IntegrityError) -> bool:
+    original = getattr(error, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint = getattr(diagnostic, "constraint_name", None)
+    return constraint == "ix_votes_unique" or "ix_votes_unique" in str(original)
 
 
 async def _update_post_score(
     db: AsyncSession, post: Post, diff: int
 ) -> None:
-    new_score = post.score + diff
-    new_hot = Post.compute_hot_score(new_score, post.inserted_at)
+    # score は DB 側で差分加算する。同時投票でも、互いの更新を
+    # Python 側の古い値で上書きしないため。
+    new_score = Post.score + diff
+    epoch = datetime(2005, 12, 8, 7, 46, 43, tzinfo=timezone.utc)
+    seconds = func.extract("epoch", Post.inserted_at - epoch)
+    new_hot_score = (
+        func.sign(new_score)
+        * func.log(10, func.greatest(func.abs(new_score), 1))
+        + seconds / 45000.0
+    )
 
-    await db.execute(
+    result = await db.execute(
         update(Post)
         .where(Post.id == post.id)
-        .values(score=new_score, hot_score=new_hot)
+        .values(score=new_score, hot_score=new_hot_score)
+        .returning(Post.score, Post.hot_score)
     )
-    # Python オブジェクトも更新する
-    post.score = new_score
-    post.hot_score = new_hot
+    updated_score, updated_hot_score = result.one()
+    # Python オブジェクトも DB が確定した値にそろえる
+    post.score = updated_score
+    post.hot_score = updated_hot_score
 
 
 # ----------------------------------------------------------------

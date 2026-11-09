@@ -54,7 +54,8 @@ FastAPI での画面実装は以下の流れです。
 
 ```python
 # app/communities/router.py
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, Form, HTTPException
+from typing import Literal
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,8 +78,8 @@ router = APIRouter()
 async def subreddit_page(
     request: Request,
     name: str,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -86,7 +87,7 @@ async def subreddit_page(
     if subreddit is None:
         raise HTTPException(status_code=404, detail=f"r/{name} は存在しません")
 
-    posts = await list_posts(db, subreddit.id, sort, page)
+    posts, has_more = await list_posts(db, subreddit.id, sort, page)
     joined = False
     if current_user:
         joined = await services.is_member(db, current_user.id, subreddit.id)
@@ -100,7 +101,7 @@ async def subreddit_page(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "joined": joined
         }
     )
@@ -114,8 +115,8 @@ async def subreddit_page(
 async def load_more_posts(
     request: Request,
     name: str,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -124,7 +125,7 @@ async def load_more_posts(
     if subreddit is None:
         raise HTTPException(status_code=404)
 
-    posts = await list_posts(db, subreddit.id, sort, page)
+    posts, has_more = await list_posts(db, subreddit.id, sort, page)
 
     return templates.TemplateResponse(
         "components/post_list.html",
@@ -134,7 +135,7 @@ async def load_more_posts(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "subreddit": subreddit
         }
     )
@@ -257,6 +258,8 @@ async def create_subreddit(
 「HTMX からのリクエストかどうか」をヘッダーで判定して1つのエンドポイントで振り分ける方法もありますが、本書では URL の時点で応答の形が決まる分け方を選びました。どの URL が何を返すかがコードの並びから読み取れ、テンプレートとの対応も追いやすくなります。部分更新のエンドポイントは「完全なページとしては表示しない」ことが前提で、返すテンプレートもコンポーネント側（`components/...`）に置かれています。
 
 もう1つ、Service との分担も確認しておきます。Router がしているのは、値の受け取り、Service の呼び出し、結果に応じた応答（画面・部分 HTML・404・リダイレクト）の選択だけです。「すでに参加済みは無視する」のようなルールの扱いも、Service が投げた `ValueError` をどう画面に反映するか、という形で書かれています。
+
+一覧の入口では、`sort` を `Literal["hot", "new"]` に限定し、`page` は `Query(1, ge=1)` で 1 以上だけを受け付けます。不正な並び方や `page=0` は、Service が負の OFFSET を作る前に 422 で止まります。次ページの有無は、Service が1件余分に読んで決めた `has_more` をそのまま使います。
 
 ---
 

@@ -2,6 +2,7 @@
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, and_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.comments.models import Comment
@@ -141,6 +142,22 @@ async def vote_comment(
             target_id=comment_id,
             value=value
         ))
+        try:
+            await db.flush()   # 一意制約の競合はここで検出する
+        except IntegrityError as e:
+            if not _is_vote_unique_violation(e):
+                raise
+            # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+            await db.rollback()
+            current_result = await db.execute(
+                select(Comment)
+                .where(Comment.id == comment_id)
+                .options(selectinload(Comment.author))
+            )
+            current_comment = current_result.scalar_one_or_none()
+            if current_comment is None:
+                raise ValueError("コメントが見つかりません")
+            return current_comment
         await _update_comment_score(db, comment, value)
         await update_karma(db, comment.author_id, "comment", value)
 
@@ -162,16 +179,24 @@ async def vote_comment(
     return comment
 
 
+def _is_vote_unique_violation(error: IntegrityError) -> bool:
+    original = getattr(error, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint = getattr(diagnostic, "constraint_name", None)
+    return constraint == "ix_votes_unique" or "ix_votes_unique" in str(original)
+
+
 async def _update_comment_score(
     db: AsyncSession, comment: Comment, diff: int
 ) -> None:
-    new_score = comment.score + diff
-    await db.execute(
+    # score は DB 側で差分加算し、同時投票でも更新を失わない
+    result = await db.execute(
         update(Comment)
         .where(Comment.id == comment.id)
-        .values(score=new_score)
+        .values(score=Comment.score + diff)
+        .returning(Comment.score)
     )
-    comment.score = new_score
+    comment.score = result.scalar_one()
 
 
 # ----------------------------------------------------------------

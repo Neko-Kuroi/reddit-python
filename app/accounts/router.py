@@ -1,5 +1,6 @@
 # app/accounts/router.py
-from fastapi import APIRouter, Depends, Request, Response, Form
+from fastapi import APIRouter, Depends, Query, Request, Response, Form
+from typing import Literal
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -138,6 +139,8 @@ async def logout():
 async def profile(
     request: Request,
     username: str,
+    sort: Literal["hot", "new"] = Query("new"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -149,7 +152,9 @@ async def profile(
             "404.html", {"request": request}, status_code=404
         )
 
-    posts = await list_user_posts(db, profile_user.id)
+    posts, has_more = await list_user_posts(
+        db, profile_user.id, sort, page
+    )
 
     return templates.TemplateResponse(
         "accounts/profile.html",
@@ -157,6 +162,9 @@ async def profile(
             "request": request,
             "current_user": current_user,
             "profile_user": profile_user,
-            "posts": posts
+            "posts": posts,
+            "sort": sort,
+            "page": page,
+            "has_more": has_more
         }
     )

@@ -48,9 +48,12 @@ mkdir -p templates/comments
 mkdir -p templates/components
 mkdir -p alembic/versions
 mkdir -p static/css
+touch static/.gitkeep
 ```
 
 このディレクトリの分け方は、第0章の3層構造と対応しています。`app/` の下の機能別フォルダ（accounts、communities など）の中に、モデル・サービス・ルーターが層ごとに並びます。`templates/` も画面の種類ごとに分け、`alembic/` は DB の変更履歴の置き場所です。
+
+`static/.gitkeep` は中身のない目印ファイルです。Git は空のディレクトリを記録しないため、これが無い状態でリポジトリを clone すると `static/` 自体が消えます。後で `main.py` が `StaticFiles(directory="static")` を読み込むときにディレクトリが無いと起動できないので、土台の時点で目印を置いておきます。
 
 ### 補足：`__init__.py` は作りません
 
@@ -260,7 +263,7 @@ async def health():
 
 **読み解き**
 
-`main.py` はアプリの入口です。今は `/health`（サーバーが生きているかを確認するためだけの応答）しかありませんが、この後ここに Router（画面ごとの受け口をまとめたもの）を登録していきます。`app.mount("/static", ...)` は CSS や画像などの静的ファイルの置き場所の宣言です（この本では CSS は CDN を使うため、実際にファイルは置きません）。
+`main.py` はアプリの入口です。今は `/health`（サーバーが生きているかを確認するためだけの応答）しかありませんが、この後ここに Router（画面ごとの受け口をまとめたもの）を登録していきます。`app.mount("/static", ...)` は CSS や画像などの静的ファイルの置き場所の宣言です（この本では CSS は CDN を使うため、実際にファイルは置きません）。ただし置き場所のディレクトリ自体は必要なので、1-1 の `.gitkeep` で `static/` が残るようにしています。
 
 ---
 

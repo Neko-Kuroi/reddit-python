@@ -73,7 +73,12 @@ class UserCreate(BaseModel):
             raise ValueError("ユーザー名は3〜20文字にしてください")
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("ユーザー名は英数字とアンダースコアのみ使用できます")
-        return v
+        return v.lower()
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
 
     @field_validator("password")
     @classmethod
@@ -188,7 +193,7 @@ class SubredditCreate(BaseModel):
             raise ValueError("コミュニティ名は3〜21文字にしてください")
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("英数字とアンダースコアのみ使用できます")
-        return v
+        return v.lower()
 
     @field_validator("description")
     @classmethod
@@ -215,7 +220,7 @@ import uuid
 import math
 from typing import ClassVar
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Integer, Float, UUID, ForeignKey, DateTime, func, text
+from sqlalchemy import String, Text, Integer, Float, UUID, ForeignKey, DateTime, Index, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base, TimestampMixin
@@ -273,9 +278,10 @@ class Post(Base, TimestampMixin):
 
     @staticmethod
     def compute_hot_score(score: int, inserted_at: datetime) -> float:
-        """Reddit オリジナルのアルゴリズムをシンプルにしたもの"""
+        """Reddit の Hot アルゴリズム（スコアの符号を保持する）"""
         epoch = datetime(2005, 12, 8, 7, 46, 43, tzinfo=timezone.utc)
-        order = math.log10(max(abs(score), 1))
+        sign = (score > 0) - (score < 0)
+        order = sign * math.log10(max(abs(score), 1))
         seconds = (inserted_at - epoch).total_seconds()
         return order + seconds / 45_000
 
@@ -288,6 +294,13 @@ class Post(Base, TimestampMixin):
 
 class Vote(Base):
     __tablename__ = "votes"
+    __table_args__ = (
+        Index(
+            "ix_votes_unique",
+            "user_id", "target_type", "target_id",
+            unique=True
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -472,6 +485,7 @@ class Report(Base):
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
 
 from app.accounts.models import User
@@ -488,23 +502,33 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
     ユーザーを登録する。
     パスワードをハッシュ化してから保存する。
     """
+    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+    username = data.username.lower()
+    email = data.email.lower()
+
     # username と email の重複チェック
     existing = await db.execute(
         select(User).where(
-            (User.username == data.username) | (User.email == data.email)
+            (User.username == username) | (User.email == email)
         )
     )
     if existing.scalar_one_or_none():
         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
 
     user = User(
-        username=data.username,
-        email=data.email,
+        username=username,
+        email=email,
         password_hash=pwd_context.hash(data.password)
     )
     db.add(user)
-    await db.flush()   # ID を確定させる（commit はしない）
-    await db.refresh(user)
+    try:
+        await db.flush()   # ID を確定させる（commit はしない）
+        await db.refresh(user)
+    except IntegrityError:
+        # 重複チェック後に別のリクエストが先に登録した場合は、
+        # DB の一意制約違反を 500 ではなく重複エラーとして返す
+        await db.rollback()
+        raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
     return user
 
 
@@ -519,7 +543,7 @@ async def authenticate_user(
     メールとパスワードでユーザーを認証する。
     失敗理由は曖昧にする（セキュリティ上の理由）。
     """
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(User.email == email.lower()))
     user = result.scalar_one_or_none()
 
     if user is None:
@@ -543,7 +567,7 @@ async def get_user_by_id(db: AsyncSession, user_id: str | uuid.UUID) -> User | N
 
 
 async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
-    result = await db.execute(select(User).where(User.username == username))
+    result = await db.execute(select(User).where(User.username == username.lower()))
     return result.scalar_one_or_none()
 
 
@@ -582,6 +606,7 @@ async def update_karma(
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, exists, and_
+from sqlalchemy.exc import IntegrityError
 
 from app.communities.models import Subreddit, SubredditMember
 from app.communities.schemas import SubredditCreate
@@ -598,31 +623,39 @@ async def create_subreddit(
     作成者を moderator として自動的に登録する。
     トランザクションで両方の操作を保護する。
     """
+    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+    name = data.name.lower()
+
     # 名前の重複チェック
     existing = await db.execute(
-        select(Subreddit).where(Subreddit.name == data.name)
+        select(Subreddit).where(Subreddit.name == name)
     )
     if existing.scalar_one_or_none():
-        raise ValueError(f"r/{data.name} はすでに存在します")
+        raise ValueError(f"r/{name} はすでに存在します")
 
     # Subreddit を作成
     subreddit = Subreddit(
-        name=data.name,
+        name=name,
         description=data.description,
         owner_id=owner_id
     )
     db.add(subreddit)
-    await db.flush()   # subreddit.id を確定させる
+    try:
+        await db.flush()   # subreddit.id を確定させる
 
-    # 作成者を moderator として登録
-    member = SubredditMember(
-        user_id=owner_id,
-        subreddit_id=subreddit.id,
-        role="moderator"
-    )
-    db.add(member)
-    await db.flush()
-    await db.refresh(subreddit)
+        # 作成者を moderator として登録
+        member = SubredditMember(
+            user_id=owner_id,
+            subreddit_id=subreddit.id,
+            role="moderator"
+        )
+        db.add(member)
+        await db.flush()
+        await db.refresh(subreddit)
+    except IntegrityError:
+        # 重複チェック後に別のリクエストが先に作成した場合は重複として返す
+        await db.rollback()
+        raise ValueError(f"r/{name} はすでに存在します")
 
     return subreddit
 
@@ -635,7 +668,7 @@ async def get_subreddit_by_name(
     db: AsyncSession, name: str
 ) -> Subreddit | None:
     result = await db.execute(
-        select(Subreddit).where(Subreddit.name == name)
+        select(Subreddit).where(Subreddit.name == name.lower())
     )
     return result.scalar_one_or_none()
 
@@ -773,6 +806,7 @@ import math
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.posts.models import Post, Vote
@@ -831,8 +865,8 @@ async def get_post(db: AsyncSession, post_id: uuid.UUID) -> Post | None:
 async def list_posts(
     db: AsyncSession, subreddit_id: uuid.UUID,
     sort: str = "hot", page: int = 1
-) -> list[Post]:
-    """Subreddit の投稿一覧（コメント数付き）"""
+) -> tuple[list[Post], bool]:
+    """Subreddit の投稿一覧（コメント数付き）と次ページの有無"""
     from app.comments.models import Comment
 
     offset = (page - 1) * PAGE_SIZE
@@ -843,7 +877,7 @@ async def list_posts(
         .where(Post.subreddit_id == subreddit_id)
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .limit(PAGE_SIZE)
+        .limit(PAGE_SIZE + 1)
         .offset(offset)
     )
     query = _apply_sort(query, sort)
@@ -851,18 +885,19 @@ async def list_posts(
     result = await db.execute(query)
     rows = result.all()
 
+    has_more = len(rows) > PAGE_SIZE
     posts = []
-    for post, comment_count in rows:
+    for post, comment_count in rows[:PAGE_SIZE]:
         post.comment_count = comment_count
         posts.append(post)
-    return posts
+    return posts, has_more
 
 
 async def list_home_posts(
     db: AsyncSession, user_id: uuid.UUID,
     sort: str = "hot", page: int = 1
-) -> list[Post]:
-    """ホーム Feed（Join 済みの投稿一覧）"""
+) -> tuple[list[Post], bool]:
+    """ホーム Feed（Join 済みの投稿一覧）と次ページの有無"""
     from app.comments.models import Comment
 
     offset = (page - 1) * PAGE_SIZE
@@ -874,7 +909,7 @@ async def list_home_posts(
         .where(SubredditMember.user_id == user_id)
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .limit(PAGE_SIZE)
+        .limit(PAGE_SIZE + 1)
         .offset(offset)
     )
     query = _apply_sort(query, sort)
@@ -882,38 +917,43 @@ async def list_home_posts(
     result = await db.execute(query)
     rows = result.all()
 
+    has_more = len(rows) > PAGE_SIZE
     posts = []
-    for post, comment_count in rows:
+    for post, comment_count in rows[:PAGE_SIZE]:
         post.comment_count = comment_count
         posts.append(post)
-    return posts
+    return posts, has_more
 
 
 async def list_user_posts(
-    db: AsyncSession, user_id: uuid.UUID, page: int = 1
-) -> list[Post]:
-    """ユーザーの投稿一覧（プロフィールページ用）"""
+    db: AsyncSession, user_id: uuid.UUID,
+    sort: str = "new", page: int = 1
+) -> tuple[list[Post], bool]:
+    """ユーザーの投稿一覧（プロフィールページ用）と次ページの有無"""
     from app.comments.models import Comment
 
     offset = (page - 1) * PAGE_SIZE
 
-    result = await db.execute(
+    query = (
         select(Post, func.count(Comment.id).label("comment_count"))
         .outerjoin(Comment, Comment.post_id == Post.id)
         .where(Post.author_id == user_id)
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .order_by(Post.inserted_at.desc())
-        .limit(PAGE_SIZE)
+        .limit(PAGE_SIZE + 1)
         .offset(offset)
     )
+    query = _apply_sort(query, sort)
+
+    result = await db.execute(query)
     rows = result.all()
 
+    has_more = len(rows) > PAGE_SIZE
     posts = []
-    for post, comment_count in rows:
+    for post, comment_count in rows[:PAGE_SIZE]:
         post.comment_count = comment_count
         posts.append(post)
-    return posts
+    return posts, has_more
 
 
 async def search_posts(db: AsyncSession, query: str) -> list[Post]:
@@ -929,7 +969,7 @@ async def search_posts(db: AsyncSession, query: str) -> list[Post]:
         .where(Post.title.ilike(term))
         .group_by(Post.id)
         .options(selectinload(Post.author), selectinload(Post.subreddit))
-        .order_by(Post.hot_score.desc())
+        .order_by(Post.hot_score.desc(), Post.id.desc())
         .limit(25)
     )
     rows = result.all()
@@ -943,8 +983,8 @@ async def search_posts(db: AsyncSession, query: str) -> list[Post]:
 
 def _apply_sort(query, sort: str):
     if sort == "new":
-        return query.order_by(Post.inserted_at.desc())
-    return query.order_by(Post.hot_score.desc())   # デフォルトは hot
+        return query.order_by(Post.inserted_at.desc(), Post.id.desc())
+    return query.order_by(Post.hot_score.desc(), Post.id.desc())
 
 
 # ----------------------------------------------------------------
@@ -979,7 +1019,18 @@ async def vote_post(
 
     if existing_vote is None:
         # パターンA: 新規投票
-        await _create_vote(db, user_id, "post", post_id, value)
+        try:
+            await _create_vote(db, user_id, "post", post_id, value)
+        except IntegrityError as e:
+            if not _is_vote_unique_violation(e):
+                raise
+            # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+            # スコアを二重に加算せず、現在の投稿をそのまま返す。
+            await db.rollback()
+            current_post = await get_post(db, post_id)
+            if current_post is None:
+                raise ValueError("投稿が見つかりません")
+            return current_post
         await _update_post_score(db, post, value)
         await update_karma(db, post.author_id, "post", value)
 
@@ -1028,23 +1079,41 @@ async def _create_vote(
         value=value
     )
     db.add(vote)
+    await db.flush()   # 一意制約の競合はここで検出する
     return vote
+
+
+def _is_vote_unique_violation(error: IntegrityError) -> bool:
+    original = getattr(error, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint = getattr(diagnostic, "constraint_name", None)
+    return constraint == "ix_votes_unique" or "ix_votes_unique" in str(original)
 
 
 async def _update_post_score(
     db: AsyncSession, post: Post, diff: int
 ) -> None:
-    new_score = post.score + diff
-    new_hot = Post.compute_hot_score(new_score, post.inserted_at)
+    # score は DB 側で差分加算する。同時投票でも、互いの更新を
+    # Python 側の古い値で上書きしないため。
+    new_score = Post.score + diff
+    epoch = datetime(2005, 12, 8, 7, 46, 43, tzinfo=timezone.utc)
+    seconds = func.extract("epoch", Post.inserted_at - epoch)
+    new_hot_score = (
+        func.sign(new_score)
+        * func.log(10, func.greatest(func.abs(new_score), 1))
+        + seconds / 45000.0
+    )
 
-    await db.execute(
+    result = await db.execute(
         update(Post)
         .where(Post.id == post.id)
-        .values(score=new_score, hot_score=new_hot)
+        .values(score=new_score, hot_score=new_hot_score)
+        .returning(Post.score, Post.hot_score)
     )
-    # Python オブジェクトも更新する
-    post.score = new_score
-    post.hot_score = new_hot
+    updated_score, updated_hot_score = result.one()
+    # Python オブジェクトも DB が確定した値にそろえる
+    post.score = updated_score
+    post.hot_score = updated_hot_score
 
 
 # ----------------------------------------------------------------
@@ -1081,6 +1150,7 @@ async def delete_post(
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, and_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.comments.models import Comment
@@ -1220,6 +1290,22 @@ async def vote_comment(
             target_id=comment_id,
             value=value
         ))
+        try:
+            await db.flush()   # 一意制約の競合はここで検出する
+        except IntegrityError as e:
+            if not _is_vote_unique_violation(e):
+                raise
+            # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+            await db.rollback()
+            current_result = await db.execute(
+                select(Comment)
+                .where(Comment.id == comment_id)
+                .options(selectinload(Comment.author))
+            )
+            current_comment = current_result.scalar_one_or_none()
+            if current_comment is None:
+                raise ValueError("コメントが見つかりません")
+            return current_comment
         await _update_comment_score(db, comment, value)
         await update_karma(db, comment.author_id, "comment", value)
 
@@ -1241,16 +1327,24 @@ async def vote_comment(
     return comment
 
 
+def _is_vote_unique_violation(error: IntegrityError) -> bool:
+    original = getattr(error, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    constraint = getattr(diagnostic, "constraint_name", None)
+    return constraint == "ix_votes_unique" or "ix_votes_unique" in str(original)
+
+
 async def _update_comment_score(
     db: AsyncSession, comment: Comment, diff: int
 ) -> None:
-    new_score = comment.score + diff
-    await db.execute(
+    # score は DB 側で差分加算し、同時投票でも更新を失わない
+    result = await db.execute(
         update(Comment)
         .where(Comment.id == comment.id)
-        .values(score=new_score)
+        .values(score=Comment.score + diff)
+        .returning(Comment.score)
     )
-    comment.score = new_score
+    comment.score = result.scalar_one()
 
 
 # ----------------------------------------------------------------

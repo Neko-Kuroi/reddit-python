@@ -16,7 +16,12 @@ class UserCreate(BaseModel):
             raise ValueError("ユーザー名は3〜20文字にしてください")
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("ユーザー名は英数字とアンダースコアのみ使用できます")
-        return v
+        return v.lower()
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
 
     @field_validator("password")
     @classmethod

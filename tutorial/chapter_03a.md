@@ -160,7 +160,12 @@ class UserCreate(BaseModel):
             raise ValueError("ユーザー名は3〜20文字にしてください")
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("ユーザー名は英数字とアンダースコアのみ使用できます")
-        return v
+        return v.lower()
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str) -> str:
+        return v.lower()
 
     @field_validator("password")
     @classmethod
@@ -183,7 +188,7 @@ class UserResponse(BaseModel):
 
 `EmailStr` は Pydantic の型で、メールアドレスの形式を自動的に検証します。
 
-`@field_validator` は Ecto のチェンジセットの `validate_format` に相当します。
+`@field_validator` は Ecto のチェンジセットの `validate_format` に相当します。ユーザー名とメールアドレスは、検証を通った時点で小文字へそろえます。`Alice` と `alice` を別々に登録できないようにし、ログインやプロフィール検索で大文字小文字を気にしなくて済むようにするためです。Service 側でも同じ正規化を行うので、入口が変わっても保存される形はそろいます。
 
 `model_config = {"from_attributes": True}` は SQLAlchemy の Model オブジェクトを Pydantic モデルに変換できるようにする設定です。
 
@@ -296,7 +301,7 @@ class SubredditCreate(BaseModel):
             raise ValueError("コミュニティ名は3〜21文字にしてください")
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("英数字とアンダースコアのみ使用できます")
-        return v
+        return v.lower()
 
     @field_validator("description")
     @classmethod
@@ -315,7 +320,7 @@ class SubredditResponse(BaseModel):
 
 **読み解き**
 
-3-4 と見比べると、Pydantic の検証の型が見えてきます。フィールド1つだけを見る検証は `@field_validator` に書き、通れば値をそのまま返し、駄目なら `ValueError` を投げます。投げられたエラーは Pydantic が集めて、呼び出し側に「どのフィールドが、なぜ駄目か」の一覧として返します。`SubredditResponse` のような出力側のスキーマに検証が無く、形の宣言だけがあるのは、入口と出口で役割が違うためです（3-1 の読み解きを参照）。
+3-4 と見比べると、Pydantic の検証の型が見えてきます。フィールド1つだけを見る検証は `@field_validator` に書き、通れば（必要なら正規化した）値を返し、駄目なら `ValueError` を投げます。投げられたエラーは Pydantic が集めて、呼び出し側に「どのフィールドが、なぜ駄目か」の一覧として返します。`SubredditResponse` のような出力側のスキーマに検証が無く、形の宣言だけがあるのは、入口と出口で役割が違うためです（3-1 の読み解きを参照）。Subreddit 名もユーザー名と同じく小文字へそろえるため、`/r/Python` と `/r/python` が別々のコミュニティになりません。
 
 ---
 

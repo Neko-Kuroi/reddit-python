@@ -15,7 +15,8 @@
 
 ```python
 # app/accounts/router.py
-from fastapi import APIRouter, Depends, Request, Response, Form
+from fastapi import APIRouter, Depends, Query, Request, Response, Form
+from typing import Literal
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -154,6 +155,8 @@ async def logout():
 async def profile(
     request: Request,
     username: str,
+    sort: Literal["hot", "new"] = Query("new"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -165,7 +168,9 @@ async def profile(
             "404.html", {"request": request}, status_code=404
         )
 
-    posts = await list_user_posts(db, profile_user.id)
+    posts, has_more = await list_user_posts(
+        db, profile_user.id, sort, page
+    )
 
     return templates.TemplateResponse(
         "accounts/profile.html",
@@ -173,7 +178,10 @@ async def profile(
             "request": request,
             "current_user": current_user,
             "profile_user": profile_user,
-            "posts": posts
+            "posts": posts,
+            "sort": sort,
+            "page": page,
+            "has_more": has_more
         }
     )
 ```
@@ -184,7 +192,8 @@ async def profile(
 
 ```python
 # app/communities/router.py
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, Form, HTTPException
+from typing import Literal
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -207,8 +216,8 @@ router = APIRouter()
 async def subreddit_page(
     request: Request,
     name: str,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -216,7 +225,7 @@ async def subreddit_page(
     if subreddit is None:
         raise HTTPException(status_code=404, detail=f"r/{name} は存在しません")
 
-    posts = await list_posts(db, subreddit.id, sort, page)
+    posts, has_more = await list_posts(db, subreddit.id, sort, page)
     joined = False
     if current_user:
         joined = await services.is_member(db, current_user.id, subreddit.id)
@@ -230,7 +239,7 @@ async def subreddit_page(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "joined": joined
         }
     )
@@ -244,8 +253,8 @@ async def subreddit_page(
 async def load_more_posts(
     request: Request,
     name: str,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -254,7 +263,7 @@ async def load_more_posts(
     if subreddit is None:
         raise HTTPException(status_code=404)
 
-    posts = await list_posts(db, subreddit.id, sort, page)
+    posts, has_more = await list_posts(db, subreddit.id, sort, page)
 
     return templates.TemplateResponse(
         "components/post_list.html",
@@ -264,7 +273,7 @@ async def load_more_posts(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "subreddit": subreddit
         }
     )
@@ -386,7 +395,9 @@ async def create_subreddit(
 
 ```python
 # app/posts/router.py
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, Form, HTTPException
+from typing import Literal
+from html import escape
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -522,7 +533,7 @@ async def vote_post(
     except ValueError as e:
         # 自分の投稿への投票など
         return HTMLResponse(
-            content=f'<span class="text-red-500 text-xs">{str(e)}</span>',
+            content=f'<span class="text-red-500 text-xs">{escape(str(e))}</span>',
             status_code=400
         )
 
@@ -570,14 +581,16 @@ async def delete_post(
 @router.get("/", response_class=HTMLResponse)
 async def home(
     request: Request,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(require_auth),
     db: AsyncSession = Depends(get_db)
 ):
     from app.communities.services import list_joined_subreddits
 
-    posts = await services.list_home_posts(db, current_user.id, sort, page)
+    posts, has_more = await services.list_home_posts(
+        db, current_user.id, sort, page
+    )
     joined_subreddits = await list_joined_subreddits(db, current_user.id)
 
     return templates.TemplateResponse(
@@ -588,7 +601,7 @@ async def home(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "joined_subreddits": joined_subreddits
         }
     )
@@ -629,6 +642,7 @@ async def search(
 ```python
 # app/comments/router.py
 from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from html import escape
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -702,7 +716,7 @@ async def vote_comment(
         comment = await services.vote_comment(db, current_user.id, comment_id, value)
     except ValueError as e:
         return HTMLResponse(
-            content=f'<span class="text-red-500 text-xs">{str(e)}</span>',
+            content=f'<span class="text-red-500 text-xs">{escape(str(e))}</span>',
             status_code=400
         )
 
@@ -781,7 +795,7 @@ async def create_report(
         )
     except ValueError as e:
         return HTMLResponse(
-            content=f'<p class="text-red-500 text-sm">{str(e)}</p>',
+            content=f'<p class="text-red-500 text-sm">{escape(str(e))}</p>',
             status_code=400
         )
 

@@ -14,7 +14,7 @@ class SubredditCreate(BaseModel):
             raise ValueError("コミュニティ名は3〜21文字にしてください")
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError("英数字とアンダースコアのみ使用できます")
-        return v
+        return v.lower()
 
     @field_validator("description")
     @classmethod

@@ -1,5 +1,6 @@
 # app/comments/router.py
 from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from html import escape
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -73,7 +74,7 @@ async def vote_comment(
         comment = await services.vote_comment(db, current_user.id, comment_id, value)
     except ValueError as e:
         return HTMLResponse(
-            content=f'<span class="text-red-500 text-xs">{str(e)}</span>',
+            content=f'<span class="text-red-500 text-xs">{escape(str(e))}</span>',
             status_code=400
         )
 
@@ -152,7 +153,7 @@ async def create_report(
         )
     except ValueError as e:
         return HTMLResponse(
-            content=f'<p class="text-red-500 text-sm">{str(e)}</p>',
+            content=f'<p class="text-red-500 text-sm">{escape(str(e))}</p>',
             status_code=400
         )
 

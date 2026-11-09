@@ -3,7 +3,7 @@ import uuid
 import math
 from typing import ClassVar
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Integer, Float, UUID, ForeignKey, DateTime, func, text
+from sqlalchemy import String, Text, Integer, Float, UUID, ForeignKey, DateTime, Index, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base, TimestampMixin
@@ -61,9 +61,10 @@ class Post(Base, TimestampMixin):
 
     @staticmethod
     def compute_hot_score(score: int, inserted_at: datetime) -> float:
-        """Reddit オリジナルのアルゴリズムをシンプルにしたもの"""
+        """Reddit の Hot アルゴリズム（スコアの符号を保持する）"""
         epoch = datetime(2005, 12, 8, 7, 46, 43, tzinfo=timezone.utc)
-        order = math.log10(max(abs(score), 1))
+        sign = (score > 0) - (score < 0)
+        order = sign * math.log10(max(abs(score), 1))
         seconds = (inserted_at - epoch).total_seconds()
         return order + seconds / 45_000
 
@@ -76,6 +77,13 @@ class Post(Base, TimestampMixin):
 
 class Vote(Base):
     __tablename__ = "votes"
+    __table_args__ = (
+        Index(
+            "ix_votes_unique",
+            "user_id", "target_type", "target_id",
+            unique=True
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

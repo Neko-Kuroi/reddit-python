@@ -1,5 +1,7 @@
 # app/posts/router.py
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, Form, HTTPException
+from typing import Literal
+from html import escape
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -135,7 +137,7 @@ async def vote_post(
     except ValueError as e:
         # 自分の投稿への投票など
         return HTMLResponse(
-            content=f'<span class="text-red-500 text-xs">{str(e)}</span>',
+            content=f'<span class="text-red-500 text-xs">{escape(str(e))}</span>',
             status_code=400
         )
 
@@ -183,14 +185,16 @@ async def delete_post(
 @router.get("/", response_class=HTMLResponse)
 async def home(
     request: Request,
-    sort: str = "hot",
-    page: int = 1,
+    sort: Literal["hot", "new"] = Query("hot"),
+    page: int = Query(1, ge=1),
     current_user=Depends(require_auth),
     db: AsyncSession = Depends(get_db)
 ):
     from app.communities.services import list_joined_subreddits
 
-    posts = await services.list_home_posts(db, current_user.id, sort, page)
+    posts, has_more = await services.list_home_posts(
+        db, current_user.id, sort, page
+    )
     joined_subreddits = await list_joined_subreddits(db, current_user.id)
 
     return templates.TemplateResponse(
@@ -201,7 +205,7 @@ async def home(
             "posts": posts,
             "sort": sort,
             "page": page,
-            "has_more": len(posts) == 25,
+            "has_more": has_more,
             "joined_subreddits": joined_subreddits
         }
     )

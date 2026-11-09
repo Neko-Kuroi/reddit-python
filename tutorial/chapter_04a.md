@@ -77,6 +77,7 @@ async def get_user(db: AsyncSession, user_id: str) -> User | None:
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
 
 from app.accounts.models import User
@@ -93,23 +94,33 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
     ユーザーを登録する。
     パスワードをハッシュ化してから保存する。
     """
+    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+    username = data.username.lower()
+    email = data.email.lower()
+
     # username と email の重複チェック
     existing = await db.execute(
         select(User).where(
-            (User.username == data.username) | (User.email == data.email)
+            (User.username == username) | (User.email == email)
         )
     )
     if existing.scalar_one_or_none():
         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
 
     user = User(
-        username=data.username,
-        email=data.email,
+        username=username,
+        email=email,
         password_hash=pwd_context.hash(data.password)
     )
     db.add(user)
-    await db.flush()   # ID を確定させる（commit はしない）
-    await db.refresh(user)
+    try:
+        await db.flush()   # ID を確定させる（commit はしない）
+        await db.refresh(user)
+    except IntegrityError:
+        # 重複チェック後に別のリクエストが先に登録した場合は、
+        # DB の一意制約違反を 500 ではなく重複エラーとして返す
+        await db.rollback()
+        raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
     return user
 
 
@@ -124,7 +135,7 @@ async def authenticate_user(
     メールとパスワードでユーザーを認証する。
     失敗理由は曖昧にする（セキュリティ上の理由）。
     """
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(User.email == email.lower()))
     user = result.scalar_one_or_none()
 
     if user is None:
@@ -148,7 +159,7 @@ async def get_user_by_id(db: AsyncSession, user_id: str | uuid.UUID) -> User | N
 
 
 async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
-    result = await db.execute(select(User).where(User.username == username))
+    result = await db.execute(select(User).where(User.username == username.lower()))
     return result.scalar_one_or_none()
 
 
@@ -188,6 +199,8 @@ async def update_karma(
 
 もう1つ見ておきたいのは、失敗の伝え方です。`create_user` は重複を見つけると `ValueError` を投げます。Service は「画面にどう表示するか」を知らないので、失敗の理由だけを例外に乗せて呼び出し側へ渡し、表示への変換は Router の仕事にしています（第5章で実際に変換します）。成功したら値、失敗したら例外、という約束が Service 全体で統一されています。
 
+名前とメールアドレスの扱いも、この章で決めておきます。第3章のスキーマで小文字化し、Service でも保存・ログイン照会・ユーザー名検索のすべてで小文字へそろえます。さらに、重複チェックと保存の間に別の登録が割り込んだ場合は DB の一意制約が最後の砦になります。その `IntegrityError` を捕まえて `rollback` し、同じ重複エラーとして返すため、競合しても 500 にはなりません。
+
 ---
 
 ## 4-4　Communities Service
@@ -197,6 +210,7 @@ async def update_karma(
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, exists, and_
+from sqlalchemy.exc import IntegrityError
 
 from app.communities.models import Subreddit, SubredditMember
 from app.communities.schemas import SubredditCreate
@@ -213,31 +227,39 @@ async def create_subreddit(
     作成者を moderator として自動的に登録する。
     トランザクションで両方の操作を保護する。
     """
+    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+    name = data.name.lower()
+
     # 名前の重複チェック
     existing = await db.execute(
-        select(Subreddit).where(Subreddit.name == data.name)
+        select(Subreddit).where(Subreddit.name == name)
     )
     if existing.scalar_one_or_none():
-        raise ValueError(f"r/{data.name} はすでに存在します")
+        raise ValueError(f"r/{name} はすでに存在します")
 
     # Subreddit を作成
     subreddit = Subreddit(
-        name=data.name,
+        name=name,
         description=data.description,
         owner_id=owner_id
     )
     db.add(subreddit)
-    await db.flush()   # subreddit.id を確定させる
+    try:
+        await db.flush()   # subreddit.id を確定させる
 
-    # 作成者を moderator として登録
-    member = SubredditMember(
-        user_id=owner_id,
-        subreddit_id=subreddit.id,
-        role="moderator"
-    )
-    db.add(member)
-    await db.flush()
-    await db.refresh(subreddit)
+        # 作成者を moderator として登録
+        member = SubredditMember(
+            user_id=owner_id,
+            subreddit_id=subreddit.id,
+            role="moderator"
+        )
+        db.add(member)
+        await db.flush()
+        await db.refresh(subreddit)
+    except IntegrityError:
+        # 重複チェック後に別のリクエストが先に作成した場合は重複として返す
+        await db.rollback()
+        raise ValueError(f"r/{name} はすでに存在します")
 
     return subreddit
 
@@ -250,7 +272,7 @@ async def get_subreddit_by_name(
     db: AsyncSession, name: str
 ) -> Subreddit | None:
     result = await db.execute(
-        select(Subreddit).where(Subreddit.name == name)
+        select(Subreddit).where(Subreddit.name == name.lower())
     )
     return result.scalar_one_or_none()
 
@@ -396,6 +418,8 @@ await db.flush()
 トランザクションは `get_db` の `yield` で管理されます。エンドポイントが正常終了すれば `commit`、例外が発生すれば `rollback` が自動的に行われます。
 
 この仕組みのおかげで、`create_subreddit` の途中で失敗しても、「Subreddit だけが作られて、作成者が参加していない」という中途半端な状態は残りません。`flush` は「DB に送って確かめる」段階であって、まだ確定（commit）ではない、という区別が大切です。Service の関数の中では `commit` を呼ばないのが、このアプリの約束になっています。
+
+Subreddit 名も、作成する側と名前で探す側の両方で小文字へそろえます。重複チェック後に別の作成が先行した場合は、Accounts と同じく一意制約の `IntegrityError` を重複エラーへ変換します。
 
 ---
 
