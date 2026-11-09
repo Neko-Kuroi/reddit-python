@@ -1,0 +1,1990 @@
+diff --git a/new/alembic/versions/XXXX_add_case_insensitive_unique_indexes.py b/alembic/versions/XXXX_add_case_insensitive_unique_indexes.py
+new file mode 100644
+index 0000000..03fa177
+--- /dev/null
++++ b/alembic/versions/XXXX_add_case_insensitive_unique_indexes.py
+@@ -0,0 +1,49 @@
++# alembic/versions/XXXX_add_case_insensitive_unique_indexes.py
++import sqlalchemy as sa
++from alembic import op
++
++# Alembic がマイグレーションの順序を特定するための宣言
++revision = "0009"
++down_revision = "0008"
++branch_labels = None
++depends_on = None
++
++# 方式B（表示用の綴りを保存し、一意性は lower() で担保する）への移行。
++# username / email / Subreddit 名は入力された綴りのまま保存し、
++# 大文字小文字違いの重複だけを関数インデックスで防ぐ。
++#
++# 注意:
++# - 教材のデータベースは新規構築が前提で、既存行の移行は行わない。
++# - すでに大文字違いの重複行（例: "Alice" と "alice"）がある DB では、
++#   lower() の一意インデックス作成が一意制約違反で失敗する。
++#   その場合は先に重複行を解消してから適用すること。
++
++def upgrade() -> None:
++    # users: 通常の一意インデックスを lower() の一意インデックスへ置き換える
++    op.drop_index("ix_users_username", table_name="users")
++    op.drop_index("ix_users_email", table_name="users")
++    op.create_index(
++        "ix_users_username_lower", "users",
++        [sa.text("lower(username)")], unique=True
++    )
++    op.create_index(
++        "ix_users_email_lower", "users",
++        [sa.text("lower(email)")], unique=True
++    )
++
++    # subreddits: 同様に置き換える
++    op.drop_index("ix_subreddits_name", table_name="subreddits")
++    op.create_index(
++        "ix_subreddits_name_lower", "subreddits",
++        [sa.text("lower(name)")], unique=True
++    )
++
++
++def downgrade() -> None:
++    op.drop_index("ix_subreddits_name_lower", table_name="subreddits")
++    op.create_index("ix_subreddits_name", "subreddits", ["name"], unique=True)
++
++    op.drop_index("ix_users_email_lower", table_name="users")
++    op.drop_index("ix_users_username_lower", table_name="users")
++    op.create_index("ix_users_email", "users", ["email"], unique=True)
++    op.create_index("ix_users_username", "users", ["username"], unique=True)
+diff --git a/app/accounts/models.py b/app/accounts/models.py
+index e76cb32..8fb2a77 100644
+--- a/app/accounts/models.py
++++ b/app/accounts/models.py
+@@ -1,20 +1,33 @@
+ # app/accounts/models.py
+ import uuid
+-from sqlalchemy import String, Integer, UUID, text
++from sqlalchemy import String, Integer, UUID, Index, column, func, text
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import Base, TimestampMixin
+ 
+ class User(Base, TimestampMixin):
+     __tablename__ = "users"
++    # 表示用の綴りはそのまま保存し、一意性は lower() の関数インデックスで担保する
++    __table_args__ = (
++        Index(
++            "ix_users_username_lower",
++            func.lower(column("username")),
++            unique=True
++        ),
++        Index(
++            "ix_users_email_lower",
++            func.lower(column("email")),
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+         primary_key=True,
+         server_default=text("uuid_generate_v4()")
+     )
+-    username: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
++    username: Mapped[str] = mapped_column(String(20), nullable=False)
++    email: Mapped[str] = mapped_column(String(255), nullable=False)
+     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+     post_karma: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+     comment_karma: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+diff --git a/app/accounts/router.py b/app/accounts/router.py
+index 70abae0..9a4238b 100644
+--- a/app/accounts/router.py
++++ b/app/accounts/router.py
+@@ -4,6 +4,8 @@ from typing import Literal
+ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, redirect_if_authenticated
+ from app.accounts import services
+@@ -46,7 +48,7 @@ async def register(
+     # Pydantic でバリデーション
+     try:
+         data = UserCreate(username=username, email=email, password=password)
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             field = error["loc"][0]
+             errors[field] = error["msg"]
+diff --git a/app/accounts/schemas.py b/app/accounts/schemas.py
+index 0a493a3..d3f175b 100644
+--- a/app/accounts/schemas.py
++++ b/app/accounts/schemas.py
+@@ -16,12 +16,8 @@ class UserCreate(BaseModel):
+             raise ValueError("ユーザー名は3〜20文字にしてください")
+         if not re.match(r"^[a-zA-Z0-9_]+$", v):
+             raise ValueError("ユーザー名は英数字とアンダースコアのみ使用できます")
+-        return v.lower()
+-
+-    @field_validator("email")
+-    @classmethod
+-    def normalize_email(cls, v: str) -> str:
+-        return v.lower()
++        # 表示用の綴りはそのまま保持する（大文字小文字の扱いは DB 側で行う）
++        return v
+ 
+     @field_validator("password")
+     @classmethod
+diff --git a/app/accounts/services.py b/app/accounts/services.py
+index 98c0288..3459dfc 100644
+--- a/app/accounts/services.py
++++ b/app/accounts/services.py
+@@ -1,7 +1,7 @@
+ # app/accounts/services.py
+ import uuid
+ from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy import select, update
++from sqlalchemy import select, update, func
+ from sqlalchemy.exc import IntegrityError
+ from passlib.context import CryptContext
+ 
+@@ -18,33 +18,33 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
+     """
+     ユーザーを登録する。
+     パスワードをハッシュ化してから保存する。
++    ユーザー名とメールは入力された綴りのまま保存し、
++    重複判定は大文字小文字を区別せずに行う。
+     """
+-    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+-    username = data.username.lower()
+-    email = data.email.lower()
+-
+-    # username と email の重複チェック
++    # username と email の重複チェック（大文字小文字を区別しない）
+     existing = await db.execute(
+         select(User).where(
+-            (User.username == username) | (User.email == email)
++            (func.lower(User.username) == data.username.lower())
++            | (func.lower(User.email) == data.email.lower())
+         )
+     )
+     if existing.scalar_one_or_none():
+         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
+ 
+     user = User(
+-        username=username,
+-        email=email,
++        username=data.username,
++        email=data.email,
+         password_hash=pwd_context.hash(data.password)
+     )
+-    db.add(user)
+     try:
+-        await db.flush()   # ID を確定させる（commit はしない）
+-        await db.refresh(user)
++        # SAVEPOINT 内で保存し、競合してもセッション全体を巻き戻さない
++        async with db.begin_nested():
++            db.add(user)
++            await db.flush()   # ID を確定させる（commit はしない）
++            await db.refresh(user)
+     except IntegrityError:
+         # 重複チェック後に別のリクエストが先に登録した場合は、
+         # DB の一意制約違反を 500 ではなく重複エラーとして返す
+-        await db.rollback()
+         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
+     return user
+ 
+@@ -60,7 +60,9 @@ async def authenticate_user(
+     メールとパスワードでユーザーを認証する。
+     失敗理由は曖昧にする（セキュリティ上の理由）。
+     """
+-    result = await db.execute(select(User).where(User.email == email.lower()))
++    result = await db.execute(
++        select(User).where(func.lower(User.email) == email.lower())
++    )
+     user = result.scalar_one_or_none()
+ 
+     if user is None:
+@@ -84,7 +86,9 @@ async def get_user_by_id(db: AsyncSession, user_id: str | uuid.UUID) -> User | N
+ 
+ 
+ async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
+-    result = await db.execute(select(User).where(User.username == username.lower()))
++    result = await db.execute(
++        select(User).where(func.lower(User.username) == username.lower())
++    )
+     return result.scalar_one_or_none()
+ 
+ 
+diff --git a/app/comments/router.py b/app/comments/router.py
+index 15b5d41..7db6950 100644
+--- a/app/comments/router.py
++++ b/app/comments/router.py
+@@ -101,31 +101,34 @@ async def delete_comment(
+     current_user=Depends(require_auth),
+     db: AsyncSession = Depends(get_db)
+ ):
+-    # subreddit_id は Referer ヘッダーから投稿ページへリダイレクト
+-    referer = request.headers.get("referer", "/")
+-
+-    # コメントを取得して subreddit_id を確認する
++    # コメントを取得して、戻り先の投稿ページを組み立てる
++    # （Referer ヘッダーは送られないことも細工されることもあるため使わない）
+     from sqlalchemy import select
+     from app.comments.models import Comment
+     from app.posts.models import Post
++    from app.communities.models import Subreddit
+ 
+     result = await db.execute(
+-        select(Comment, Post.subreddit_id)
++        select(Comment, Post.id, Post.subreddit_id, Subreddit.name)
+         .join(Post, Post.id == Comment.post_id)
++        .join(Subreddit, Subreddit.id == Post.subreddit_id)
+         .where(Comment.id == comment_id)
+     )
+     row = result.first()
+     if row is None:
+         raise HTTPException(status_code=404)
+ 
+-    comment, subreddit_id = row
++    comment, post_id, subreddit_id, subreddit_name = row
+ 
+     try:
+         await services.delete_comment(db, comment_id, current_user.id, subreddit_id)
+     except PermissionError:
+         raise HTTPException(status_code=403, detail="削除する権限がありません")
+ 
+-    return RedirectResponse(url=referer, status_code=303)
++    return RedirectResponse(
++        url=f"/r/{subreddit_name}/{post_id}",
++        status_code=303
++    )
+ 
+ 
+ # ----------------------------------------------------------------
+diff --git a/app/comments/services.py b/app/comments/services.py
+index c5b8f70..eb81dc1 100644
+--- a/app/comments/services.py
++++ b/app/comments/services.py
+@@ -122,7 +122,8 @@ async def vote_comment(
+     if comment.author_id == user_id:
+         raise ValueError("自分のコメントには投票できません")
+ 
+-    # 既存の投票を確認する
++    # 既存の投票を確認する（FOR UPDATE で行をロックし、
++    # 並行する変更・取り消しと判断が一続きになるようにする）
+     existing = await db.execute(
+         select(Vote).where(
+             and_(
+@@ -130,25 +131,26 @@ async def vote_comment(
+                 Vote.target_type == "comment",
+                 Vote.target_id == comment_id
+             )
+-        )
++        ).with_for_update()
+     )
+     existing_vote = existing.scalar_one_or_none()
+ 
+     if existing_vote is None:
+         # パターンA: 新規投票
+-        db.add(Vote(
+-            user_id=user_id,
+-            target_type="comment",
+-            target_id=comment_id,
+-            value=value
+-        ))
+         try:
+-            await db.flush()   # 一意制約の競合はここで検出する
++            # SAVEPOINT 内で保存し、競合しても全体を巻き戻さない
++            async with db.begin_nested():
++                db.add(Vote(
++                    user_id=user_id,
++                    target_type="comment",
++                    target_id=comment_id,
++                    value=value
++                ))
++                await db.flush()   # 一意制約の競合はここで検出する
+         except IntegrityError as e:
+             if not _is_vote_unique_violation(e):
+                 raise
+             # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+-            await db.rollback()
+             current_result = await db.execute(
+                 select(Comment)
+                 .where(Comment.id == comment_id)
+diff --git a/app/communities/models.py b/app/communities/models.py
+index bb9640e..5ef1a6a 100644
+--- a/app/communities/models.py
++++ b/app/communities/models.py
+@@ -1,20 +1,28 @@
+ # app/communities/models.py
+ import uuid
+ from datetime import datetime
+-from sqlalchemy import String, Text, UUID, ForeignKey, DateTime, func, text
++from sqlalchemy import String, Text, UUID, ForeignKey, DateTime, Index, column, func, text
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import Base, TimestampMixin
+ 
+ class Subreddit(Base, TimestampMixin):
+     __tablename__ = "subreddits"
++    # 表示用の綴りはそのまま保存し、一意性は lower() の関数インデックスで担保する
++    __table_args__ = (
++        Index(
++            "ix_subreddits_name_lower",
++            func.lower(column("name")),
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+         primary_key=True,
+         server_default=text("uuid_generate_v4()")
+     )
+-    name: Mapped[str] = mapped_column(String(21), unique=True, nullable=False)
++    name: Mapped[str] = mapped_column(String(21), nullable=False)
+     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+     owner_id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+@@ -35,6 +43,14 @@ class Subreddit(Base, TimestampMixin):
+ 
+ class SubredditMember(Base):
+     __tablename__ = "subreddit_members"
++    # 1人1回のみ Join 可能（マイグレーション 0004 の定義と一致させる）
++    __table_args__ = (
++        Index(
++            "ix_subreddit_members_unique",
++            "user_id", "subreddit_id",
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+diff --git a/app/communities/router.py b/app/communities/router.py
+index 2100e0c..344051d 100644
+--- a/app/communities/router.py
++++ b/app/communities/router.py
+@@ -4,6 +4,8 @@ from typing import Literal
+ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, require_auth
+ from app.communities import services
+@@ -172,7 +174,7 @@ async def create_subreddit(
+ 
+     try:
+         data = SubredditCreate(name=name, description=description or None)
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             errors[error["loc"][0]] = error["msg"]
+         return templates.TemplateResponse(
+diff --git a/app/communities/schemas.py b/app/communities/schemas.py
+index 8233aca..59da5e7 100644
+--- a/app/communities/schemas.py
++++ b/app/communities/schemas.py
+@@ -14,7 +14,8 @@ class SubredditCreate(BaseModel):
+             raise ValueError("コミュニティ名は3〜21文字にしてください")
+         if not re.match(r"^[a-zA-Z0-9_]+$", v):
+             raise ValueError("英数字とアンダースコアのみ使用できます")
+-        return v.lower()
++        # 表示用の綴りはそのまま保持する（大文字小文字の扱いは DB 側で行う）
++        return v
+ 
+     @field_validator("description")
+     @classmethod
+diff --git a/app/communities/services.py b/app/communities/services.py
+index c2ae101..7f8f0ca 100644
+--- a/app/communities/services.py
++++ b/app/communities/services.py
+@@ -1,7 +1,7 @@
+ # app/communities/services.py
+ import uuid
+ from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy import select, exists, and_
++from sqlalchemy import select, exists, and_, func
+ from sqlalchemy.exc import IntegrityError
+ 
+ from app.communities.models import Subreddit, SubredditMember
+@@ -17,41 +17,41 @@ async def create_subreddit(
+     """
+     Subreddit を作成する。
+     作成者を moderator として自動的に登録する。
+-    トランザクションで両方の操作を保護する。
++    名前は入力された綴りのまま保存し、重複判定は大文字小文字を区別しない。
+     """
+-    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+-    name = data.name.lower()
+-
+-    # 名前の重複チェック
++    # 名前の重複チェック（大文字小文字を区別しない）
+     existing = await db.execute(
+-        select(Subreddit).where(Subreddit.name == name)
++        select(Subreddit).where(func.lower(Subreddit.name) == data.name.lower())
+     )
+     if existing.scalar_one_or_none():
+-        raise ValueError(f"r/{name} はすでに存在します")
++        raise ValueError(f"r/{data.name} はすでに存在します")
+ 
+     # Subreddit を作成
+     subreddit = Subreddit(
+-        name=name,
++        name=data.name,
+         description=data.description,
+         owner_id=owner_id
+     )
+-    db.add(subreddit)
+     try:
+-        await db.flush()   # subreddit.id を確定させる
+-
+-        # 作成者を moderator として登録
+-        member = SubredditMember(
+-            user_id=owner_id,
+-            subreddit_id=subreddit.id,
+-            role="moderator"
+-        )
+-        db.add(member)
+-        await db.flush()
+-        await db.refresh(subreddit)
++        # SAVEPOINT 内で保存し、競合してもセッション全体を巻き戻さない。
++        # （全体を rollback すると current_user が期限切れになり、
++        #   エラー画面の描画が MissingGreenlet で落ちる）
++        async with db.begin_nested():
++            db.add(subreddit)
++            await db.flush()   # subreddit.id を確定させる
++
++            # 作成者を moderator として登録
++            member = SubredditMember(
++                user_id=owner_id,
++                subreddit_id=subreddit.id,
++                role="moderator"
++            )
++            db.add(member)
++            await db.flush()
++            await db.refresh(subreddit)
+     except IntegrityError:
+         # 重複チェック後に別のリクエストが先に作成した場合は重複として返す
+-        await db.rollback()
+-        raise ValueError(f"r/{name} はすでに存在します")
++        raise ValueError(f"r/{data.name} はすでに存在します")
+ 
+     return subreddit
+ 
+@@ -64,7 +64,7 @@ async def get_subreddit_by_name(
+     db: AsyncSession, name: str
+ ) -> Subreddit | None:
+     result = await db.execute(
+-        select(Subreddit).where(Subreddit.name == name.lower())
++        select(Subreddit).where(func.lower(Subreddit.name) == name.lower())
+     )
+     return result.scalar_one_or_none()
+ 
+@@ -95,8 +95,13 @@ async def join_subreddit(
+         subreddit_id=subreddit_id,
+         role="member"
+     )
+-    db.add(member)
+-    await db.flush()
++    try:
++        # 二重クリック等で確認と保存の間に競合しても 500 にしない
++        async with db.begin_nested():
++            db.add(member)
++            await db.flush()
++    except IntegrityError:
++        raise ValueError("すでに参加しています")
+     return member
+ 
+ 
+diff --git a/app/posts/router.py b/app/posts/router.py
+index 4c578a6..7d5613d 100644
+--- a/app/posts/router.py
++++ b/app/posts/router.py
+@@ -6,6 +6,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ import uuid
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, require_auth
+ from app.posts import services
+@@ -68,7 +70,7 @@ async def create_post(
+             body=body if post_type == "text" else None,
+             url=url if post_type == "link" else None
+         )
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             field = error["loc"][0] if error["loc"] else "general"
+             errors[field] = error["msg"]
+diff --git a/app/posts/schemas.py b/app/posts/schemas.py
+index 091d963..87847ae 100644
+--- a/app/posts/schemas.py
++++ b/app/posts/schemas.py
+@@ -16,6 +16,14 @@ class PostCreate(BaseModel):
+             raise ValueError("タイトルは1〜300文字にしてください")
+         return v
+ 
++    @field_validator("url")
++    @classmethod
++    def validate_url(cls, v: str | None) -> str | None:
++        # DB のカラム長（String(2048)）に合わせ、DB エラーではなく検証で弾く
++        if v is not None and len(v) > 2048:
++            raise ValueError("URLは2048文字以内にしてください")
++        return v
++
+     @field_validator("body")
+     @classmethod
+     def validate_body(cls, v: str | None) -> str | None:
+diff --git a/app/posts/services.py b/app/posts/services.py
+index 4d29e48..b1b4160 100644
+--- a/app/posts/services.py
++++ b/app/posts/services.py
+@@ -224,7 +224,8 @@ async def vote_post(
+                 raise
+             # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+             # スコアを二重に加算せず、現在の投稿をそのまま返す。
+-            await db.rollback()
++            # （失敗した票は SAVEPOINT で巻き戻し済みなので、
++            #   セッション全体の rollback はしない）
+             current_post = await get_post(db, post_id)
+             if current_post is None:
+                 raise ValueError("投稿が見つかりません")
+@@ -254,6 +255,8 @@ async def _get_vote(
+     db: AsyncSession, user_id: uuid.UUID,
+     target_type: str, target_id: uuid.UUID
+ ) -> Vote | None:
++    # FOR UPDATE で票の行をロックし、並行する変更・取り消しと
++    # 「読む → 判断する → 更新する」が一続きになるようにする
+     result = await db.execute(
+         select(Vote).where(
+             and_(
+@@ -261,7 +264,7 @@ async def _get_vote(
+                 Vote.target_type == target_type,
+                 Vote.target_id == target_id
+             )
+-        )
++        ).with_for_update()
+     )
+     return result.scalar_one_or_none()
+ 
+@@ -276,8 +279,11 @@ async def _create_vote(
+         target_id=target_id,
+         value=value
+     )
+-    db.add(vote)
+-    await db.flush()   # 一意制約の競合はここで検出する
++    # SAVEPOINT 内で保存し、一意制約の競合が起きても
++    # セッション全体を巻き戻さずに済むようにする
++    async with db.begin_nested():
++        db.add(vote)
++        await db.flush()   # 一意制約の競合はここで検出する
+     return vote
+ 
+ 
+diff --git a/tutorial/appendix.md b/tutorial/appendix.md
+index d9048e7..8022317 100644
+--- a/tutorial/appendix.md
++++ b/tutorial/appendix.md
+@@ -53,7 +53,7 @@ reddit_clone/
+ │
+ ├─ alembic/
+ │   ├─ env.py                         ← マイグレーションの実行環境（第1章）
+-│   └─ versions/                      ← マイグレーション8件（第2章）
++│   └─ versions/                      ← マイグレーション9件（第2章）
+ │       ├─ XXXX_enable_uuid_extension.py
+ │       ├─ XXXX_create_users.py
+ │       ├─ XXXX_create_subreddits.py
+@@ -107,7 +107,7 @@ reddit_clone/
+ | `app/database.py` | 第1章（第3章で TimestampMixin を追加） |
+ | `app/dependencies.py` | 第1章（準備）→ 第5章（完成） |
+ | `alembic/env.py` | 第1章 |
+-| `alembic/versions/*.py`（8件） | 第2章 |
++| `alembic/versions/*.py`（9件） | 第2章 |
+ | `app/accounts/models.py` | 第3章 |
+ | `app/accounts/schemas.py` | 第3章 |
+ | `app/communities/models.py` | 第3章 |
+@@ -161,6 +161,7 @@ reddit_clone/
+ | `0006` | `XXXX_create_comments.py` | comments テーブル | 2-8 |
+ | `0007` | `XXXX_create_votes.py` | votes テーブル | 2-9 |
+ | `0008` | `XXXX_create_reports.py` | reports テーブル | 2-10 |
++| `0009` | `XXXX_add_case_insensitive_unique_indexes.py` | username / email / Subreddit 名の `lower()` 一意インデックス（方式B） | 2-11 |
+ 
+ ---
+ 
+diff --git a/tutorial/appendix_code_01_foundation.md b/tutorial/appendix_code_01_foundation.md
+index 73ed008..239bce0 100644
+--- a/tutorial/appendix_code_01_foundation.md
++++ b/tutorial/appendix_code_01_foundation.md
+@@ -856,6 +856,62 @@ def downgrade() -> None:
+     op.drop_table("reports")
+ ```
+ 
++## alembic/versions/XXXX_add_case_insensitive_unique_indexes.py
++
++対応: 第2章。正本: `alembic/versions/XXXX_add_case_insensitive_unique_indexes.py`
++
++```python
++# alembic/versions/XXXX_add_case_insensitive_unique_indexes.py
++import sqlalchemy as sa
++from alembic import op
++
++# Alembic がマイグレーションの順序を特定するための宣言
++revision = "0009"
++down_revision = "0008"
++branch_labels = None
++depends_on = None
++
++# 方式B（表示用の綴りを保存し、一意性は lower() で担保する）への移行。
++# username / email / Subreddit 名は入力された綴りのまま保存し、
++# 大文字小文字違いの重複だけを関数インデックスで防ぐ。
++#
++# 注意:
++# - 教材のデータベースは新規構築が前提で、既存行の移行は行わない。
++# - すでに大文字違いの重複行（例: "Alice" と "alice"）がある DB では、
++#   lower() の一意インデックス作成が一意制約違反で失敗する。
++#   その場合は先に重複行を解消してから適用すること。
++
++def upgrade() -> None:
++    # users: 通常の一意インデックスを lower() の一意インデックスへ置き換える
++    op.drop_index("ix_users_username", table_name="users")
++    op.drop_index("ix_users_email", table_name="users")
++    op.create_index(
++        "ix_users_username_lower", "users",
++        [sa.text("lower(username)")], unique=True
++    )
++    op.create_index(
++        "ix_users_email_lower", "users",
++        [sa.text("lower(email)")], unique=True
++    )
++
++    # subreddits: 同様に置き換える
++    op.drop_index("ix_subreddits_name", table_name="subreddits")
++    op.create_index(
++        "ix_subreddits_name_lower", "subreddits",
++        [sa.text("lower(name)")], unique=True
++    )
++
++
++def downgrade() -> None:
++    op.drop_index("ix_subreddits_name_lower", table_name="subreddits")
++    op.create_index("ix_subreddits_name", "subreddits", ["name"], unique=True)
++
++    op.drop_index("ix_users_email_lower", table_name="users")
++    op.drop_index("ix_users_username_lower", table_name="users")
++    op.create_index("ix_users_email", "users", ["email"], unique=True)
++    op.create_index("ix_users_username", "users", ["username"], unique=True)
++```
++
+ ## requirements.txt
+ 
+ 対応: 第1章。正本: `requirements.txt`
+diff --git a/tutorial/appendix_code_02_models_services.md b/tutorial/appendix_code_02_models_services.md
+index 0720a76..f67aa4f 100644
+--- a/tutorial/appendix_code_02_models_services.md
++++ b/tutorial/appendix_code_02_models_services.md
+@@ -16,21 +16,34 @@
+ ```python
+ # app/accounts/models.py
+ import uuid
+-from sqlalchemy import String, Integer, UUID, text
++from sqlalchemy import String, Integer, UUID, Index, column, func, text
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import Base, TimestampMixin
+ 
+ class User(Base, TimestampMixin):
+     __tablename__ = "users"
++    # 表示用の綴りはそのまま保存し、一意性は lower() の関数インデックスで担保する
++    __table_args__ = (
++        Index(
++            "ix_users_username_lower",
++            func.lower(column("username")),
++            unique=True
++        ),
++        Index(
++            "ix_users_email_lower",
++            func.lower(column("email")),
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+         primary_key=True,
+         server_default=text("uuid_generate_v4()")
+     )
+-    username: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
++    username: Mapped[str] = mapped_column(String(20), nullable=False)
++    email: Mapped[str] = mapped_column(String(255), nullable=False)
+     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+     post_karma: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+     comment_karma: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+@@ -73,12 +86,8 @@ class UserCreate(BaseModel):
+             raise ValueError("ユーザー名は3〜20文字にしてください")
+         if not re.match(r"^[a-zA-Z0-9_]+$", v):
+             raise ValueError("ユーザー名は英数字とアンダースコアのみ使用できます")
+-        return v.lower()
+-
+-    @field_validator("email")
+-    @classmethod
+-    def normalize_email(cls, v: str) -> str:
+-        return v.lower()
++        # 表示用の綴りはそのまま保持する（大文字小文字の扱いは DB 側で行う）
++        return v
+ 
+     @field_validator("password")
+     @classmethod
+@@ -105,20 +114,28 @@ class UserResponse(BaseModel):
+ # app/communities/models.py
+ import uuid
+ from datetime import datetime
+-from sqlalchemy import String, Text, UUID, ForeignKey, DateTime, func, text
++from sqlalchemy import String, Text, UUID, ForeignKey, DateTime, Index, column, func, text
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import Base, TimestampMixin
+ 
+ class Subreddit(Base, TimestampMixin):
+     __tablename__ = "subreddits"
++    # 表示用の綴りはそのまま保存し、一意性は lower() の関数インデックスで担保する
++    __table_args__ = (
++        Index(
++            "ix_subreddits_name_lower",
++            func.lower(column("name")),
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+         primary_key=True,
+         server_default=text("uuid_generate_v4()")
+     )
+-    name: Mapped[str] = mapped_column(String(21), unique=True, nullable=False)
++    name: Mapped[str] = mapped_column(String(21), nullable=False)
+     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+     owner_id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+@@ -139,6 +156,14 @@ class Subreddit(Base, TimestampMixin):
+ 
+ class SubredditMember(Base):
+     __tablename__ = "subreddit_members"
++    # 1人1回のみ Join 可能（マイグレーション 0004 の定義と一致させる）
++    __table_args__ = (
++        Index(
++            "ix_subreddit_members_unique",
++            "user_id", "subreddit_id",
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+@@ -193,7 +218,8 @@ class SubredditCreate(BaseModel):
+             raise ValueError("コミュニティ名は3〜21文字にしてください")
+         if not re.match(r"^[a-zA-Z0-9_]+$", v):
+             raise ValueError("英数字とアンダースコアのみ使用できます")
+-        return v.lower()
++        # 表示用の綴りはそのまま保持する（大文字小文字の扱いは DB 側で行う）
++        return v
+ 
+     @field_validator("description")
+     @classmethod
+@@ -345,6 +371,14 @@ class PostCreate(BaseModel):
+             raise ValueError("タイトルは1〜300文字にしてください")
+         return v
+ 
++    @field_validator("url")
++    @classmethod
++    def validate_url(cls, v: str | None) -> str | None:
++        # DB のカラム長（String(2048)）に合わせ、DB エラーではなく検証で弾く
++        if v is not None and len(v) > 2048:
++            raise ValueError("URLは2048文字以内にしてください")
++        return v
++
+     @field_validator("body")
+     @classmethod
+     def validate_body(cls, v: str | None) -> str | None:
+@@ -484,7 +518,7 @@ class Report(Base):
+ # app/accounts/services.py
+ import uuid
+ from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy import select, update
++from sqlalchemy import select, update, func
+ from sqlalchemy.exc import IntegrityError
+ from passlib.context import CryptContext
+ 
+@@ -501,33 +535,33 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
+     """
+     ユーザーを登録する。
+     パスワードをハッシュ化してから保存する。
++    ユーザー名とメールは入力された綴りのまま保存し、
++    重複判定は大文字小文字を区別せずに行う。
+     """
+-    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+-    username = data.username.lower()
+-    email = data.email.lower()
+-
+-    # username と email の重複チェック
++    # username と email の重複チェック（大文字小文字を区別しない）
+     existing = await db.execute(
+         select(User).where(
+-            (User.username == username) | (User.email == email)
++            (func.lower(User.username) == data.username.lower())
++            | (func.lower(User.email) == data.email.lower())
+         )
+     )
+     if existing.scalar_one_or_none():
+         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
+ 
+     user = User(
+-        username=username,
+-        email=email,
++        username=data.username,
++        email=data.email,
+         password_hash=pwd_context.hash(data.password)
+     )
+-    db.add(user)
+     try:
+-        await db.flush()   # ID を確定させる（commit はしない）
+-        await db.refresh(user)
++        # SAVEPOINT 内で保存し、競合してもセッション全体を巻き戻さない
++        async with db.begin_nested():
++            db.add(user)
++            await db.flush()   # ID を確定させる（commit はしない）
++            await db.refresh(user)
+     except IntegrityError:
+         # 重複チェック後に別のリクエストが先に登録した場合は、
+         # DB の一意制約違反を 500 ではなく重複エラーとして返す
+-        await db.rollback()
+         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
+     return user
+ 
+@@ -543,7 +577,9 @@ async def authenticate_user(
+     メールとパスワードでユーザーを認証する。
+     失敗理由は曖昧にする（セキュリティ上の理由）。
+     """
+-    result = await db.execute(select(User).where(User.email == email.lower()))
++    result = await db.execute(
++        select(User).where(func.lower(User.email) == email.lower())
++    )
+     user = result.scalar_one_or_none()
+ 
+     if user is None:
+@@ -567,7 +603,9 @@ async def get_user_by_id(db: AsyncSession, user_id: str | uuid.UUID) -> User | N
+ 
+ 
+ async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
+-    result = await db.execute(select(User).where(User.username == username.lower()))
++    result = await db.execute(
++        select(User).where(func.lower(User.username) == username.lower())
++    )
+     return result.scalar_one_or_none()
+ 
+ 
+@@ -605,7 +643,7 @@ async def update_karma(
+ # app/communities/services.py
+ import uuid
+ from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy import select, exists, and_
++from sqlalchemy import select, exists, and_, func
+ from sqlalchemy.exc import IntegrityError
+ 
+ from app.communities.models import Subreddit, SubredditMember
+@@ -621,41 +659,41 @@ async def create_subreddit(
+     """
+     Subreddit を作成する。
+     作成者を moderator として自動的に登録する。
+-    トランザクションで両方の操作を保護する。
++    名前は入力された綴りのまま保存し、重複判定は大文字小文字を区別しない。
+     """
+-    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+-    name = data.name.lower()
+-
+-    # 名前の重複チェック
++    # 名前の重複チェック（大文字小文字を区別しない）
+     existing = await db.execute(
+-        select(Subreddit).where(Subreddit.name == name)
++        select(Subreddit).where(func.lower(Subreddit.name) == data.name.lower())
+     )
+     if existing.scalar_one_or_none():
+-        raise ValueError(f"r/{name} はすでに存在します")
++        raise ValueError(f"r/{data.name} はすでに存在します")
+ 
+     # Subreddit を作成
+     subreddit = Subreddit(
+-        name=name,
++        name=data.name,
+         description=data.description,
+         owner_id=owner_id
+     )
+-    db.add(subreddit)
+     try:
+-        await db.flush()   # subreddit.id を確定させる
+-
+-        # 作成者を moderator として登録
+-        member = SubredditMember(
+-            user_id=owner_id,
+-            subreddit_id=subreddit.id,
+-            role="moderator"
+-        )
+-        db.add(member)
+-        await db.flush()
+-        await db.refresh(subreddit)
++        # SAVEPOINT 内で保存し、競合してもセッション全体を巻き戻さない。
++        # （全体を rollback すると current_user が期限切れになり、
++        #   エラー画面の描画が MissingGreenlet で落ちる）
++        async with db.begin_nested():
++            db.add(subreddit)
++            await db.flush()   # subreddit.id を確定させる
++
++            # 作成者を moderator として登録
++            member = SubredditMember(
++                user_id=owner_id,
++                subreddit_id=subreddit.id,
++                role="moderator"
++            )
++            db.add(member)
++            await db.flush()
++            await db.refresh(subreddit)
+     except IntegrityError:
+         # 重複チェック後に別のリクエストが先に作成した場合は重複として返す
+-        await db.rollback()
+-        raise ValueError(f"r/{name} はすでに存在します")
++        raise ValueError(f"r/{data.name} はすでに存在します")
+ 
+     return subreddit
+ 
+@@ -668,7 +706,7 @@ async def get_subreddit_by_name(
+     db: AsyncSession, name: str
+ ) -> Subreddit | None:
+     result = await db.execute(
+-        select(Subreddit).where(Subreddit.name == name.lower())
++        select(Subreddit).where(func.lower(Subreddit.name) == name.lower())
+     )
+     return result.scalar_one_or_none()
+ 
+@@ -699,8 +737,13 @@ async def join_subreddit(
+         subreddit_id=subreddit_id,
+         role="member"
+     )
+-    db.add(member)
+-    await db.flush()
++    try:
++        # 二重クリック等で確認と保存の間に競合しても 500 にしない
++        async with db.begin_nested():
++            db.add(member)
++            await db.flush()
++    except IntegrityError:
++        raise ValueError("すでに参加しています")
+     return member
+ 
+ 
+@@ -1026,7 +1069,8 @@ async def vote_post(
+                 raise
+             # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+             # スコアを二重に加算せず、現在の投稿をそのまま返す。
+-            await db.rollback()
++            # （失敗した票は SAVEPOINT で巻き戻し済みなので、
++            #   セッション全体の rollback はしない）
+             current_post = await get_post(db, post_id)
+             if current_post is None:
+                 raise ValueError("投稿が見つかりません")
+@@ -1056,6 +1100,8 @@ async def _get_vote(
+     db: AsyncSession, user_id: uuid.UUID,
+     target_type: str, target_id: uuid.UUID
+ ) -> Vote | None:
++    # FOR UPDATE で票の行をロックし、並行する変更・取り消しと
++    # 「読む → 判断する → 更新する」が一続きになるようにする
+     result = await db.execute(
+         select(Vote).where(
+             and_(
+@@ -1063,7 +1109,7 @@ async def _get_vote(
+                 Vote.target_type == target_type,
+                 Vote.target_id == target_id
+             )
+-        )
++        ).with_for_update()
+     )
+     return result.scalar_one_or_none()
+ 
+@@ -1078,8 +1124,11 @@ async def _create_vote(
+         target_id=target_id,
+         value=value
+     )
+-    db.add(vote)
+-    await db.flush()   # 一意制約の競合はここで検出する
++    # SAVEPOINT 内で保存し、一意制約の競合が起きても
++    # セッション全体を巻き戻さずに済むようにする
++    async with db.begin_nested():
++        db.add(vote)
++        await db.flush()   # 一意制約の競合はここで検出する
+     return vote
+ 
+ 
+@@ -1270,7 +1319,8 @@ async def vote_comment(
+     if comment.author_id == user_id:
+         raise ValueError("自分のコメントには投票できません")
+ 
+-    # 既存の投票を確認する
++    # 既存の投票を確認する（FOR UPDATE で行をロックし、
++    # 並行する変更・取り消しと判断が一続きになるようにする）
+     existing = await db.execute(
+         select(Vote).where(
+             and_(
+@@ -1278,25 +1328,26 @@ async def vote_comment(
+                 Vote.target_type == "comment",
+                 Vote.target_id == comment_id
+             )
+-        )
++        ).with_for_update()
+     )
+     existing_vote = existing.scalar_one_or_none()
+ 
+     if existing_vote is None:
+         # パターンA: 新規投票
+-        db.add(Vote(
+-            user_id=user_id,
+-            target_type="comment",
+-            target_id=comment_id,
+-            value=value
+-        ))
+         try:
+-            await db.flush()   # 一意制約の競合はここで検出する
++            # SAVEPOINT 内で保存し、競合しても全体を巻き戻さない
++            async with db.begin_nested():
++                db.add(Vote(
++                    user_id=user_id,
++                    target_type="comment",
++                    target_id=comment_id,
++                    value=value
++                ))
++                await db.flush()   # 一意制約の競合はここで検出する
+         except IntegrityError as e:
+             if not _is_vote_unique_violation(e):
+                 raise
+             # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+-            await db.rollback()
+             current_result = await db.execute(
+                 select(Comment)
+                 .where(Comment.id == comment_id)
+diff --git a/tutorial/appendix_code_03_routers.md b/tutorial/appendix_code_03_routers.md
+index 4002826..be65dbd 100644
+--- a/tutorial/appendix_code_03_routers.md
++++ b/tutorial/appendix_code_03_routers.md
+@@ -20,6 +20,8 @@ from typing import Literal
+ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, redirect_if_authenticated
+ from app.accounts import services
+@@ -62,7 +64,7 @@ async def register(
+     # Pydantic でバリデーション
+     try:
+         data = UserCreate(username=username, email=email, password=password)
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             field = error["loc"][0]
+             errors[field] = error["msg"]
+@@ -197,6 +199,8 @@ from typing import Literal
+ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, require_auth
+ from app.communities import services
+@@ -365,7 +369,7 @@ async def create_subreddit(
+ 
+     try:
+         data = SubredditCreate(name=name, description=description or None)
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             errors[error["loc"][0]] = error["msg"]
+         return templates.TemplateResponse(
+@@ -402,6 +406,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ import uuid
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, require_auth
+ from app.posts import services
+@@ -464,7 +470,7 @@ async def create_post(
+             body=body if post_type == "text" else None,
+             url=url if post_type == "link" else None
+         )
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             field = error["loc"][0] if error["loc"] else "general"
+             errors[field] = error["msg"]
+@@ -743,31 +749,34 @@ async def delete_comment(
+     current_user=Depends(require_auth),
+     db: AsyncSession = Depends(get_db)
+ ):
+-    # subreddit_id は Referer ヘッダーから投稿ページへリダイレクト
+-    referer = request.headers.get("referer", "/")
+-
+-    # コメントを取得して subreddit_id を確認する
++    # コメントを取得して、戻り先の投稿ページを組み立てる
++    # （Referer ヘッダーは送られないことも細工されることもあるため使わない）
+     from sqlalchemy import select
+     from app.comments.models import Comment
+     from app.posts.models import Post
++    from app.communities.models import Subreddit
+ 
+     result = await db.execute(
+-        select(Comment, Post.subreddit_id)
++        select(Comment, Post.id, Post.subreddit_id, Subreddit.name)
+         .join(Post, Post.id == Comment.post_id)
++        .join(Subreddit, Subreddit.id == Post.subreddit_id)
+         .where(Comment.id == comment_id)
+     )
+     row = result.first()
+     if row is None:
+         raise HTTPException(status_code=404)
+ 
+-    comment, subreddit_id = row
++    comment, post_id, subreddit_id, subreddit_name = row
+ 
+     try:
+         await services.delete_comment(db, comment_id, current_user.id, subreddit_id)
+     except PermissionError:
+         raise HTTPException(status_code=403, detail="削除する権限がありません")
+ 
+-    return RedirectResponse(url=referer, status_code=303)
++    return RedirectResponse(
++        url=f"/r/{subreddit_name}/{post_id}",
++        status_code=303
++    )
+ 
+ 
+ # ----------------------------------------------------------------
+diff --git a/tutorial/chapter_01.md b/tutorial/chapter_01.md
+index 6bb8ce1..c72b502 100644
+--- a/tutorial/chapter_01.md
++++ b/tutorial/chapter_01.md
+@@ -282,7 +282,7 @@ alembic init alembic
+ | `alembic/versions/` | 空のディレクトリ。第2章でマイグレーションファイルをここに作る |
+ | `alembic/script.py.mako` | **生成されたまま使う**（新しいマイグレーションを生成するときの雛形） |
+ 
+-なお、第2章で作るマイグレーションファイルには、Alembic が実行順序を特定するための `revision` / `down_revision` の宣言が必須です。本書では第2章の順序どおりに `0001` → `0008` の連鎖にしています（宣言が無いと `alembic upgrade head` が「revision を特定できない」というエラーで失敗します）。
++なお、第2章で作るマイグレーションファイルには、Alembic が実行順序を特定するための `revision` / `down_revision` の宣言が必須です。本書では第2章の順序どおりに `0001` → `0009` の連鎖にしています（宣言が無いと `alembic upgrade head` が「revision を特定できない」というエラーで失敗します）。
+ 
+ `alembic/env.py` を編集して、SQLAlchemy の非同期エンジンに対応させます。
+ 
+diff --git a/tutorial/chapter_02a.md b/tutorial/chapter_02a.md
+index e06f96b..9de5e19 100644
+--- a/tutorial/chapter_02a.md
++++ b/tutorial/chapter_02a.md
+@@ -88,7 +88,7 @@ Elixir版と同様に主キーは UUID を使います。PostgreSQL の `uuid-os
+ alembic revision -m "enable uuid extension"
+ ```
+ 
+-生成されたファイルを編集します。各マイグレーションファイルの先頭には `revision`（そのファイル自身の ID）と `down_revision`（1つ前のファイルの ID）の宣言を書きます。Alembic はこの連鎖をたどって実行順序を決めるため、宣言が無いファイルがあると `alembic upgrade head` が失敗します。本書では第2章の作成順に `0001` から `0008` まで連鎖させます（ファイル名の `XXXX_` は生成日時などに置き換わる部分で、順序はファイル名ではなくこの宣言で決まります）。
++生成されたファイルを編集します。各マイグレーションファイルの先頭には `revision`（そのファイル自身の ID）と `down_revision`（1つ前のファイルの ID）の宣言を書きます。Alembic はこの連鎖をたどって実行順序を決めるため、宣言が無いファイルがあると `alembic upgrade head` が失敗します。本書では第2章の作成順に `0001` から `0009` まで連鎖させます（ファイル名の `XXXX_` は生成日時などに置き換わる部分で、順序はファイル名ではなくこの宣言で決まります）。
+ 
+ ```python
+ # alembic/versions/XXXX_enable_uuid_extension.py
+diff --git a/tutorial/chapter_02b.md b/tutorial/chapter_02b.md
+index e587375..0753c23 100644
+--- a/tutorial/chapter_02b.md
++++ b/tutorial/chapter_02b.md
+@@ -142,7 +142,71 @@ reports も votes と同じく、対象を `target_type` と `target_id` の組
+ 
+ ---
+ 
+-## 2-11　マイグレーションを実行する
++## 2-11　大文字小文字を区別しない一意インデックス
++
++```python
++# alembic/versions/XXXX_add_case_insensitive_unique_indexes.py
++import sqlalchemy as sa
++from alembic import op
++
++# Alembic がマイグレーションの順序を特定するための宣言
++revision = "0009"
++down_revision = "0008"
++branch_labels = None
++depends_on = None
++
++# 方式B（表示用の綴りを保存し、一意性は lower() で担保する）への移行。
++# username / email / Subreddit 名は入力された綴りのまま保存し、
++# 大文字小文字違いの重複だけを関数インデックスで防ぐ。
++#
++# 注意:
++# - 教材のデータベースは新規構築が前提で、既存行の移行は行わない。
++# - すでに大文字違いの重複行（例: "Alice" と "alice"）がある DB では、
++#   lower() の一意インデックス作成が一意制約違反で失敗する。
++#   その場合は先に重複行を解消してから適用すること。
++
++def upgrade() -> None:
++    # users: 通常の一意インデックスを lower() の一意インデックスへ置き換える
++    op.drop_index("ix_users_username", table_name="users")
++    op.drop_index("ix_users_email", table_name="users")
++    op.create_index(
++        "ix_users_username_lower", "users",
++        [sa.text("lower(username)")], unique=True
++    )
++    op.create_index(
++        "ix_users_email_lower", "users",
++        [sa.text("lower(email)")], unique=True
++    )
++
++    # subreddits: 同様に置き換える
++    op.drop_index("ix_subreddits_name", table_name="subreddits")
++    op.create_index(
++        "ix_subreddits_name_lower", "subreddits",
++        [sa.text("lower(name)")], unique=True
++    )
++
++
++def downgrade() -> None:
++    op.drop_index("ix_subreddits_name_lower", table_name="subreddits")
++    op.create_index("ix_subreddits_name", "subreddits", ["name"], unique=True)
++
++    op.drop_index("ix_users_email_lower", table_name="users")
++    op.drop_index("ix_users_username_lower", table_name="users")
++    op.create_index("ix_users_email", "users", ["email"], unique=True)
++    op.create_index("ix_users_username", "users", ["username"], unique=True)
++```
++
++**読み解き**
++
++ユーザー名・メール・Subreddit 名の扱いは「方式B」にします。入力された綴りはそのまま保存して表示にも使い（`Alice` は `Alice` のまま）、重複の判定だけを大文字小文字を区別せずに行います。その判定をアプリの確認だけに頼ると、同時登録の競合ですり抜けることがあるため、DB 側にも `lower(列)` という関数インデックスを一意で張り、最後の砦にします。
++
++通常のユニークインデックス（0002・0003 で作成）は綴りが完全一致する場合しか防げないため、このマイグレーションで置き換えます。モデル側の定義（第3章）も同じ形にそろえます。
++
++既存データについての注意も、このファイルの冒頭コメントに残してあります。教材の DB は新規構築が前提なので既存行の移行はしませんが、すでに大文字違いの重複行がある DB では、インデックスを作る時点で一意制約違反になり適用が失敗します。
++
++---
++
++## 2-12　マイグレーションを実行する
+ 
+ DB を作成してからマイグレーションを実行します。
+ 
+@@ -162,11 +226,12 @@ INFO  [alembic.runtime.migration] Running upgrade 0001 -> 0002, create users
+ INFO  [alembic.runtime.migration] Running upgrade 0002 -> 0003, create subreddits
+ ...（続く）
+ INFO  [alembic.runtime.migration] Running upgrade 0007 -> 0008, create reports
++INFO  [alembic.runtime.migration] Running upgrade 0008 -> 0009, add case insensitive unique indexes
+ ```
+ 
+ ---
+ 
+-## 2-12　マイグレーションのやり直し方
++## 2-13　マイグレーションのやり直し方
+ 
+ ```bash
+ # 1つ前に戻す
+@@ -184,7 +249,7 @@ alembic history
+ 
+ ---
+ 
+-## 2-13　テーブルの確認
++## 2-14　テーブルの確認
+ 
+ ```bash
+ psql -d reddit_clone_dev
+@@ -218,10 +283,10 @@ psql -d reddit_clone_dev
+ 
+ ## 動作確認（この章の仕上げ）
+ 
+-2-11〜2-13 の確認に加えて、この章の終わりに次を確かめてください。前提は、PostgreSQL が起動していることと、第1章の `.env` が設定済みであることです。
++2-12〜2-14 の確認に加えて、この章の終わりに次を確かめてください。前提は、PostgreSQL が起動していることと、第1章の `.env` が設定済みであることです。
+ 
+-- [ ] `alembic upgrade head` が 0001 から 0008 まで順に適用され、エラーなく終わる
+-- [ ] `alembic current` が `0008 (head)` と表示される
++- [ ] `alembic upgrade head` が 0001 から 0009 まで順に適用され、エラーなく終わる
++- [ ] `alembic current` が `0009 (head)` と表示される
+ - [ ] `psql` の `\dt` で、7つのテーブルと `alembic_version` が並ぶ
+ - [ ] `alembic downgrade base` で全て戻り、もう一度 `alembic upgrade head` で戻せる（往復できること）
+ 
+@@ -231,8 +296,8 @@ psql -d reddit_clone_dev
+ 
+ | 症状 | 原因 | 直し方 |
+ |------|------|--------|
+-| `alembic upgrade head` が revision を特定できないという趣旨のエラーで止まる | マイグレーションファイルに `revision` / `down_revision` の宣言が無い、または連鎖が切れている | 2-3 の宣言が8件すべてにあり、`0001`（down が `None`）から `0008` まで一本につながっているか確認する |
+-| 接続エラーでマイグレーションが始まらない | PostgreSQL が起動していない、対象 DB が無い、または `.env` の接続情報が違う | PostgreSQL の起動と、2-11 の DB 作成を確認する。接続情報は第1章 1-3 の `.env` が正本 |
++| `alembic upgrade head` が revision を特定できないという趣旨のエラーで止まる | マイグレーションファイルに `revision` / `down_revision` の宣言が無い、または連鎖が切れている | 2-3 の宣言が9件すべてにあり、`0001`（down が `None`）から `0009` まで一本につながっているか確認する |
++| 接続エラーでマイグレーションが始まらない | PostgreSQL が起動していない、対象 DB が無い、または `.env` の接続情報が違う | PostgreSQL の起動と、2-12 の DB 作成を確認する。接続情報は第1章 1-3 の `.env` が正本 |
+ | 外部キー制約のエラーで `upgrade` が途中で止まる | 適用順が依存関係と逆になっている（例: posts が users より先） | revision の連鎖が、2-2 の依存順（users → subreddits → …）と一致しているか確認する |
+ | `downgrade` したのにテーブルや拡張が残る | `downgrade` の内容が `upgrade` の逆になっていない | 各ファイルの `downgrade` が、作ったものを逆順に消しているか確認する |
+ 
+diff --git a/tutorial/chapter_03a.md b/tutorial/chapter_03a.md
+index 67ec1f3..58086d1 100644
+--- a/tutorial/chapter_03a.md
++++ b/tutorial/chapter_03a.md
+@@ -85,21 +85,34 @@ Mixin（ミックスイン）は、「共通の部品を、継承で各クラス
+ ```python
+ # app/accounts/models.py
+ import uuid
+-from sqlalchemy import String, Integer, UUID, text
++from sqlalchemy import String, Integer, UUID, Index, column, func, text
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import Base, TimestampMixin
+ 
+ class User(Base, TimestampMixin):
+     __tablename__ = "users"
++    # 表示用の綴りはそのまま保存し、一意性は lower() の関数インデックスで担保する
++    __table_args__ = (
++        Index(
++            "ix_users_username_lower",
++            func.lower(column("username")),
++            unique=True
++        ),
++        Index(
++            "ix_users_email_lower",
++            func.lower(column("email")),
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+         primary_key=True,
+         server_default=text("uuid_generate_v4()")
+     )
+-    username: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
++    username: Mapped[str] = mapped_column(String(20), nullable=False)
++    email: Mapped[str] = mapped_column(String(255), nullable=False)
+     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+     post_karma: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+     comment_karma: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+@@ -125,10 +138,10 @@ class User(Base, TimestampMixin):
+ 
+ ```python
+ # 古い書き方（SQLAlchemy 1.x）
+-username = Column(String(20), unique=True, nullable=False)
++password_hash = Column(String(255), nullable=False)
+ 
+ # 新しい書き方（SQLAlchemy 2.0）
+-username: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
++password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+ ```
+ 
+ 新しい書き方は型安全性が高く、IDE の補完も効きます。
+@@ -137,6 +150,8 @@ username: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+ 
+ なお、主キーの `server_default` は `text("uuid_generate_v4()")` のように SQL 式の形で書きます。ただの文字列で書くと SQL 側で文字列リテラルとして解釈されてしまい、UUID を生成する既定値として機能しません（第2章のマイグレーション側の書き方と揃えています）。以降のモデルもすべてこの形に統一します。
+ 
++`username` と `email` に `unique=True` を付けていない点にも注目してください。一意性は、クラスの頭に置いた `__table_args__` の関数インデックス `lower(username)` / `lower(email)` で担保します（方式B）。保存される綴りは入力どおりに残し、「`Alice` と `alice` は同じユーザー名」という判定だけを DB に守らせる形です。第2章のマイグレーション 0009 で作るインデックスと、名前も含めて一致させています。
++
+ ---
+ 
+ ## 3-4　User の Pydantic スキーマ
+@@ -160,12 +175,8 @@ class UserCreate(BaseModel):
+             raise ValueError("ユーザー名は3〜20文字にしてください")
+         if not re.match(r"^[a-zA-Z0-9_]+$", v):
+             raise ValueError("ユーザー名は英数字とアンダースコアのみ使用できます")
+-        return v.lower()
+-
+-    @field_validator("email")
+-    @classmethod
+-    def normalize_email(cls, v: str) -> str:
+-        return v.lower()
++        # 表示用の綴りはそのまま保持する（大文字小文字の扱いは DB 側で行う）
++        return v
+ 
+     @field_validator("password")
+     @classmethod
+@@ -188,7 +199,7 @@ class UserResponse(BaseModel):
+ 
+ `EmailStr` は Pydantic の型で、メールアドレスの形式を自動的に検証します。
+ 
+-`@field_validator` は Ecto のチェンジセットの `validate_format` に相当します。ユーザー名とメールアドレスは、検証を通った時点で小文字へそろえます。`Alice` と `alice` を別々に登録できないようにし、ログインやプロフィール検索で大文字小文字を気にしなくて済むようにするためです。Service 側でも同じ正規化を行うので、入口が変わっても保存される形はそろいます。
++`@field_validator` は Ecto のチェンジセットの `validate_format` に相当します。ユーザー名とメールアドレスは、ここでは形式の検証だけを行い、綴りは書き換えません。`Alice` と `alice` を別々に登録できないようにする判定は、Service 側の `lower()` 比較と DB の関数インデックス（方式B）が担います。入口で綴りを保持しておくことで、表示名として入力どおりの表記を使えます。なおメールアドレスについては、`EmailStr` がドメイン部だけを小文字に正規化します（ドメイン名は元々大文字小文字を区別しないためで、ユーザー名部分の綴りは保持されます）。
+ 
+ `model_config = {"from_attributes": True}` は SQLAlchemy の Model オブジェクトを Pydantic モデルに変換できるようにする設定です。
+ 
+@@ -207,20 +218,28 @@ response = UserResponse.model_validate(user)  # Model → Pydantic
+ # app/communities/models.py
+ import uuid
+ from datetime import datetime
+-from sqlalchemy import String, Text, UUID, ForeignKey, DateTime, func, text
++from sqlalchemy import String, Text, UUID, ForeignKey, DateTime, Index, column, func, text
+ from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import Base, TimestampMixin
+ 
+ class Subreddit(Base, TimestampMixin):
+     __tablename__ = "subreddits"
++    # 表示用の綴りはそのまま保存し、一意性は lower() の関数インデックスで担保する
++    __table_args__ = (
++        Index(
++            "ix_subreddits_name_lower",
++            func.lower(column("name")),
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+         primary_key=True,
+         server_default=text("uuid_generate_v4()")
+     )
+-    name: Mapped[str] = mapped_column(String(21), unique=True, nullable=False)
++    name: Mapped[str] = mapped_column(String(21), nullable=False)
+     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+     owner_id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+@@ -241,6 +260,14 @@ class Subreddit(Base, TimestampMixin):
+ 
+ class SubredditMember(Base):
+     __tablename__ = "subreddit_members"
++    # 1人1回のみ Join 可能（マイグレーション 0004 の定義と一致させる）
++    __table_args__ = (
++        Index(
++            "ix_subreddit_members_unique",
++            "user_id", "subreddit_id",
++            unique=True
++        ),
++    )
+ 
+     id: Mapped[uuid.UUID] = mapped_column(
+         UUID(as_uuid=True),
+@@ -280,6 +307,8 @@ class SubredditMember(Base):
+ 
+ `SubredditMember` は `TimestampMixin` を使わず `inserted_at` だけを持ちます。更新日時は不要だからです。Elixir版の `timestamps(updated_at: false)` に相当します。
+ 
++インデックスの置き方も見ておきます。`Subreddit` の `name` は、User と同じく `lower(name)` の関数インデックスで一意性を担保します（方式B）。`SubredditMember` には `(user_id, subreddit_id)` の一意インデックスを張り、同じ人が同じ Subreddit へ二重に参加できないことを DB に守らせます。どちらも第2章のマイグレーション（0003・0004・0009）の定義と一致させています。
++
+ ---
+ 
+ ## 3-6　Subreddit の Pydantic スキーマ
+@@ -301,7 +330,8 @@ class SubredditCreate(BaseModel):
+             raise ValueError("コミュニティ名は3〜21文字にしてください")
+         if not re.match(r"^[a-zA-Z0-9_]+$", v):
+             raise ValueError("英数字とアンダースコアのみ使用できます")
+-        return v.lower()
++        # 表示用の綴りはそのまま保持する（大文字小文字の扱いは DB 側で行う）
++        return v
+ 
+     @field_validator("description")
+     @classmethod
+@@ -320,7 +350,7 @@ class SubredditResponse(BaseModel):
+ 
+ **読み解き**
+ 
+-3-4 と見比べると、Pydantic の検証の型が見えてきます。フィールド1つだけを見る検証は `@field_validator` に書き、通れば（必要なら正規化した）値を返し、駄目なら `ValueError` を投げます。投げられたエラーは Pydantic が集めて、呼び出し側に「どのフィールドが、なぜ駄目か」の一覧として返します。`SubredditResponse` のような出力側のスキーマに検証が無く、形の宣言だけがあるのは、入口と出口で役割が違うためです（3-1 の読み解きを参照）。Subreddit 名もユーザー名と同じく小文字へそろえるため、`/r/Python` と `/r/python` が別々のコミュニティになりません。
++3-4 と見比べると、Pydantic の検証の型が見えてきます。フィールド1つだけを見る検証は `@field_validator` に書き、通れば（必要なら正規化した）値を返し、駄目なら `ValueError` を投げます。投げられたエラーは Pydantic が集めて、呼び出し側に「どのフィールドが、なぜ駄目か」の一覧として返します。`SubredditResponse` のような出力側のスキーマに検証が無く、形の宣言だけがあるのは、入口と出口で役割が違うためです（3-1 の読み解きを参照）。Subreddit 名もユーザー名と同じ方式Bで、綴りは保持したまま重複だけを区別しません。そのため `/r/Python` と `/r/python` は同じコミュニティを指し、別々のコミュニティにはなりません。
+ 
+ ---
+ 
+diff --git a/tutorial/chapter_03b.md b/tutorial/chapter_03b.md
+index 0b15acc..3637a0d 100644
+--- a/tutorial/chapter_03b.md
++++ b/tutorial/chapter_03b.md
+@@ -123,6 +123,14 @@ class PostCreate(BaseModel):
+             raise ValueError("タイトルは1〜300文字にしてください")
+         return v
+ 
++    @field_validator("url")
++    @classmethod
++    def validate_url(cls, v: str | None) -> str | None:
++        # DB のカラム長（String(2048)）に合わせ、DB エラーではなく検証で弾く
++        if v is not None and len(v) > 2048:
++            raise ValueError("URLは2048文字以内にしてください")
++        return v
++
+     @field_validator("body")
+     @classmethod
+     def validate_body(cls, v: str | None) -> str | None:
+diff --git a/tutorial/chapter_04a.md b/tutorial/chapter_04a.md
+index df391af..4b29563 100644
+--- a/tutorial/chapter_04a.md
++++ b/tutorial/chapter_04a.md
+@@ -76,7 +76,7 @@ async def get_user(db: AsyncSession, user_id: str) -> User | None:
+ # app/accounts/services.py
+ import uuid
+ from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy import select, update
++from sqlalchemy import select, update, func
+ from sqlalchemy.exc import IntegrityError
+ from passlib.context import CryptContext
+ 
+@@ -93,33 +93,33 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
+     """
+     ユーザーを登録する。
+     パスワードをハッシュ化してから保存する。
++    ユーザー名とメールは入力された綴りのまま保存し、
++    重複判定は大文字小文字を区別せずに行う。
+     """
+-    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+-    username = data.username.lower()
+-    email = data.email.lower()
+-
+-    # username と email の重複チェック
++    # username と email の重複チェック（大文字小文字を区別しない）
+     existing = await db.execute(
+         select(User).where(
+-            (User.username == username) | (User.email == email)
++            (func.lower(User.username) == data.username.lower())
++            | (func.lower(User.email) == data.email.lower())
+         )
+     )
+     if existing.scalar_one_or_none():
+         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
+ 
+     user = User(
+-        username=username,
+-        email=email,
++        username=data.username,
++        email=data.email,
+         password_hash=pwd_context.hash(data.password)
+     )
+-    db.add(user)
+     try:
+-        await db.flush()   # ID を確定させる（commit はしない）
+-        await db.refresh(user)
++        # SAVEPOINT 内で保存し、競合してもセッション全体を巻き戻さない
++        async with db.begin_nested():
++            db.add(user)
++            await db.flush()   # ID を確定させる（commit はしない）
++            await db.refresh(user)
+     except IntegrityError:
+         # 重複チェック後に別のリクエストが先に登録した場合は、
+         # DB の一意制約違反を 500 ではなく重複エラーとして返す
+-        await db.rollback()
+         raise ValueError("このユーザー名またはメールアドレスはすでに使われています")
+     return user
+ 
+@@ -135,7 +135,9 @@ async def authenticate_user(
+     メールとパスワードでユーザーを認証する。
+     失敗理由は曖昧にする（セキュリティ上の理由）。
+     """
+-    result = await db.execute(select(User).where(User.email == email.lower()))
++    result = await db.execute(
++        select(User).where(func.lower(User.email) == email.lower())
++    )
+     user = result.scalar_one_or_none()
+ 
+     if user is None:
+@@ -159,7 +161,9 @@ async def get_user_by_id(db: AsyncSession, user_id: str | uuid.UUID) -> User | N
+ 
+ 
+ async def get_user_by_username(db: AsyncSession, username: str) -> User | None:
+-    result = await db.execute(select(User).where(User.username == username.lower()))
++    result = await db.execute(
++        select(User).where(func.lower(User.username) == username.lower())
++    )
+     return result.scalar_one_or_none()
+ 
+ 
+@@ -199,7 +203,7 @@ async def update_karma(
+ 
+ もう1つ見ておきたいのは、失敗の伝え方です。`create_user` は重複を見つけると `ValueError` を投げます。Service は「画面にどう表示するか」を知らないので、失敗の理由だけを例外に乗せて呼び出し側へ渡し、表示への変換は Router の仕事にしています（第5章で実際に変換します）。成功したら値、失敗したら例外、という約束が Service 全体で統一されています。
+ 
+-名前とメールアドレスの扱いも、この章で決めておきます。第3章のスキーマで小文字化し、Service でも保存・ログイン照会・ユーザー名検索のすべてで小文字へそろえます。さらに、重複チェックと保存の間に別の登録が割り込んだ場合は DB の一意制約が最後の砦になります。その `IntegrityError` を捕まえて `rollback` し、同じ重複エラーとして返すため、競合しても 500 にはなりません。
++名前とメールアドレスの扱いも、この章で決めておきます。入力された綴りはそのまま保存し（方式B。第2章 2-11 の関数インデックスと第3章のモデル定義が土台です）、重複チェック・ログイン照会・ユーザー名検索では `lower()` 同士で比べて、大文字小文字を区別しません。さらに、重複チェックと保存の間に別の登録が割り込んだ場合は、DB の `lower()` 一意インデックスが最後の砦になります。保存は SAVEPOINT（`begin_nested`）の中で行い、`IntegrityError` を捕まえて同じ重複エラーとして返すため、競合しても 500 にはなりません。セッション全体を `rollback` しないので、呼び出し側が持っている他のオブジェクト（ログイン中のユーザーなど）が期限切れになる副作用もありません。
+ 
+ ---
+ 
+@@ -209,7 +213,7 @@ async def update_karma(
+ # app/communities/services.py
+ import uuid
+ from sqlalchemy.ext.asyncio import AsyncSession
+-from sqlalchemy import select, exists, and_
++from sqlalchemy import select, exists, and_, func
+ from sqlalchemy.exc import IntegrityError
+ 
+ from app.communities.models import Subreddit, SubredditMember
+@@ -225,41 +229,41 @@ async def create_subreddit(
+     """
+     Subreddit を作成する。
+     作成者を moderator として自動的に登録する。
+-    トランザクションで両方の操作を保護する。
++    名前は入力された綴りのまま保存し、重複判定は大文字小文字を区別しない。
+     """
+-    # 大文字小文字を区別しないよう、保存前に小文字へそろえる
+-    name = data.name.lower()
+-
+-    # 名前の重複チェック
++    # 名前の重複チェック（大文字小文字を区別しない）
+     existing = await db.execute(
+-        select(Subreddit).where(Subreddit.name == name)
++        select(Subreddit).where(func.lower(Subreddit.name) == data.name.lower())
+     )
+     if existing.scalar_one_or_none():
+-        raise ValueError(f"r/{name} はすでに存在します")
++        raise ValueError(f"r/{data.name} はすでに存在します")
+ 
+     # Subreddit を作成
+     subreddit = Subreddit(
+-        name=name,
++        name=data.name,
+         description=data.description,
+         owner_id=owner_id
+     )
+-    db.add(subreddit)
+     try:
+-        await db.flush()   # subreddit.id を確定させる
+-
+-        # 作成者を moderator として登録
+-        member = SubredditMember(
+-            user_id=owner_id,
+-            subreddit_id=subreddit.id,
+-            role="moderator"
+-        )
+-        db.add(member)
+-        await db.flush()
+-        await db.refresh(subreddit)
++        # SAVEPOINT 内で保存し、競合してもセッション全体を巻き戻さない。
++        # （全体を rollback すると current_user が期限切れになり、
++        #   エラー画面の描画が MissingGreenlet で落ちる）
++        async with db.begin_nested():
++            db.add(subreddit)
++            await db.flush()   # subreddit.id を確定させる
++
++            # 作成者を moderator として登録
++            member = SubredditMember(
++                user_id=owner_id,
++                subreddit_id=subreddit.id,
++                role="moderator"
++            )
++            db.add(member)
++            await db.flush()
++            await db.refresh(subreddit)
+     except IntegrityError:
+         # 重複チェック後に別のリクエストが先に作成した場合は重複として返す
+-        await db.rollback()
+-        raise ValueError(f"r/{name} はすでに存在します")
++        raise ValueError(f"r/{data.name} はすでに存在します")
+ 
+     return subreddit
+ 
+@@ -272,7 +276,7 @@ async def get_subreddit_by_name(
+     db: AsyncSession, name: str
+ ) -> Subreddit | None:
+     result = await db.execute(
+-        select(Subreddit).where(Subreddit.name == name.lower())
++        select(Subreddit).where(func.lower(Subreddit.name) == name.lower())
+     )
+     return result.scalar_one_or_none()
+ 
+@@ -303,8 +307,13 @@ async def join_subreddit(
+         subreddit_id=subreddit_id,
+         role="member"
+     )
+-    db.add(member)
+-    await db.flush()
++    try:
++        # 二重クリック等で確認と保存の間に競合しても 500 にしない
++        async with db.begin_nested():
++            db.add(member)
++            await db.flush()
++    except IntegrityError:
++        raise ValueError("すでに参加しています")
+     return member
+ 
+ 
+@@ -419,7 +428,7 @@ await db.flush()
+ 
+ この仕組みのおかげで、`create_subreddit` の途中で失敗しても、「Subreddit だけが作られて、作成者が参加していない」という中途半端な状態は残りません。`flush` は「DB に送って確かめる」段階であって、まだ確定（commit）ではない、という区別が大切です。Service の関数の中では `commit` を呼ばないのが、このアプリの約束になっています。
+ 
+-Subreddit 名も、作成する側と名前で探す側の両方で小文字へそろえます。重複チェック後に別の作成が先行した場合は、Accounts と同じく一意制約の `IntegrityError` を重複エラーへ変換します。
++Subreddit 名もユーザー名と同じ方式Bで、入力された綴りのまま保存し、重複チェックと名前での検索は `lower()` 同士の比較で行います。重複チェック後に別の作成が先行した場合は、Accounts と同じく SAVEPOINT の中で保存し、一意制約の `IntegrityError` を重複エラーへ変換します。参加（`join_subreddit`）も同じ形で、二重クリックで確認と保存の間に競合しても 500 にはなりません。
+ 
+ ---
+ 
+diff --git a/tutorial/chapter_04b.md b/tutorial/chapter_04b.md
+index 0bf8cae..3db1ab2 100644
+--- a/tutorial/chapter_04b.md
++++ b/tutorial/chapter_04b.md
+@@ -231,7 +231,8 @@ async def vote_post(
+                 raise
+             # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+             # スコアを二重に加算せず、現在の投稿をそのまま返す。
+-            await db.rollback()
++            # （失敗した票は SAVEPOINT で巻き戻し済みなので、
++            #   セッション全体の rollback はしない）
+             current_post = await get_post(db, post_id)
+             if current_post is None:
+                 raise ValueError("投稿が見つかりません")
+@@ -261,6 +262,8 @@ async def _get_vote(
+     db: AsyncSession, user_id: uuid.UUID,
+     target_type: str, target_id: uuid.UUID
+ ) -> Vote | None:
++    # FOR UPDATE で票の行をロックし、並行する変更・取り消しと
++    # 「読む → 判断する → 更新する」が一続きになるようにする
+     result = await db.execute(
+         select(Vote).where(
+             and_(
+@@ -268,7 +271,7 @@ async def _get_vote(
+                 Vote.target_type == target_type,
+                 Vote.target_id == target_id
+             )
+-        )
++        ).with_for_update()
+     )
+     return result.scalar_one_or_none()
+ 
+@@ -283,8 +286,11 @@ async def _create_vote(
+         target_id=target_id,
+         value=value
+     )
+-    db.add(vote)
+-    await db.flush()   # 一意制約の競合はここで検出する
++    # SAVEPOINT 内で保存し、一意制約の競合が起きても
++    # セッション全体を巻き戻さずに済むようにする
++    async with db.begin_nested():
++        db.add(vote)
++        await db.flush()   # 一意制約の競合はここで検出する
+     return vote
+ 
+ 
+@@ -371,7 +377,9 @@ else:                               # パターンC: 変更
+ 
+ `hot_score` は第3章でモデルに定義した式と同じ計算を、投票時は SQL の中でも行います。スコアの絶対値を `log10` で圧縮し、正負の符号を掛けたものと、投稿時刻の新しさを足し合わせます。スコアの桁が1つ増えるごとに大きさは `+1` され、正なら上、負なら下へ動きます。投稿時刻が約12.5時間新しいごとにも `+1` されるため、「評価が高い投稿」と「新しい投稿」の両方を上に出す指標になります。
+ 
+-同時実行への備えも、この節の大切な点です。新規投票では、まず Vote を `flush` して一意インデックスに競合を判定させます。同じ票が並行して届いた片方は `IntegrityError` を受け取り、スコアを加算せず現在の投稿を返します。競合が無ければ、`_update_post_score` が `Post.score + diff` という DB 側の式でスコアを更新し、同じ SQL で符号付きの `hot_score` も計算します。Python 側で古いスコアを読んで絶対値を書き戻す形ではないため、別の利用者の投票を上書きして消すことがありません。
++同時実行への備えも、この節の大切な点です。新規投票では、まず Vote を SAVEPOINT の中で `flush` して一意インデックスに競合を判定させます。同じ票が並行して届いた片方は `IntegrityError` を受け取り、スコアを加算せず現在の投稿を返します。競合が無ければ、`_update_post_score` が `Post.score + diff` という DB 側の式でスコアを更新し、同じ SQL で符号付きの `hot_score` も計算します。Python 側で古いスコアを読んで絶対値を書き戻す形ではないため、別の利用者の投票を上書きして消すことがありません。
++
++変更・取り消し（パターンB・C）の競合には、票の行ロックで備えます。`_get_vote` は `FOR UPDATE` 付きで既存の票を読むため、同じ票への操作が並行しても「読む → 判断する → 更新する」が一続きになり、片方が終わる（コミットされる）まで他方は待ちます。ロックが無いと、両方が同じ古い票を見て変化量を二重に数えてしまい、投稿のスコアと実際の票の合計がずれてしまいます。
+ 
+ 一覧では、並びの第1キーだけでは同点の順序が決まりません。Hot では `hot_score` の後に、New では投稿時刻の後に、必ず `Post.id` を第2キーとして付けます。また Service は1ページ分より1件多く読み、`has_more` も一緒に返します。ちょうど25件だけのときに、実際には無い次ページをあるものとして表示しないためです。
+ 
+diff --git a/tutorial/chapter_04c.md b/tutorial/chapter_04c.md
+index d86fc90..b727ebd 100644
+--- a/tutorial/chapter_04c.md
++++ b/tutorial/chapter_04c.md
+@@ -129,7 +129,8 @@ async def vote_comment(
+     if comment.author_id == user_id:
+         raise ValueError("自分のコメントには投票できません")
+ 
+-    # 既存の投票を確認する
++    # 既存の投票を確認する（FOR UPDATE で行をロックし、
++    # 並行する変更・取り消しと判断が一続きになるようにする）
+     existing = await db.execute(
+         select(Vote).where(
+             and_(
+@@ -137,25 +138,26 @@ async def vote_comment(
+                 Vote.target_type == "comment",
+                 Vote.target_id == comment_id
+             )
+-        )
++        ).with_for_update()
+     )
+     existing_vote = existing.scalar_one_or_none()
+ 
+     if existing_vote is None:
+         # パターンA: 新規投票
+-        db.add(Vote(
+-            user_id=user_id,
+-            target_type="comment",
+-            target_id=comment_id,
+-            value=value
+-        ))
+         try:
+-            await db.flush()   # 一意制約の競合はここで検出する
++            # SAVEPOINT 内で保存し、競合しても全体を巻き戻さない
++            async with db.begin_nested():
++                db.add(Vote(
++                    user_id=user_id,
++                    target_type="comment",
++                    target_id=comment_id,
++                    value=value
++                ))
++                await db.flush()   # 一意制約の競合はここで検出する
+         except IntegrityError as e:
+             if not _is_vote_unique_violation(e):
+                 raise
+             # 同じ投票が並行して届いた場合は、先に保存された票が正本。
+-            await db.rollback()
+             current_result = await db.execute(
+                 select(Comment)
+                 .where(Comment.id == comment_id)
+@@ -264,7 +266,7 @@ def _build_tree(comments):
+ 
+ もう1つ、この設計の肝は「DB への問い合わせは最初の1回だけ」という点です。コメントごとに「その子はどれか」を DB へ聞きに行くと、コメントの数だけクエリが増えてしまいます（中編の N+1 の話と同じです）。先に全件を取ってメモリ上で組み立てることで、コメントが何件でもクエリは1回で済みます。`children` は DB のカラムではなく、この組み立てのときにインスタンスへ付ける属性です（第3章の `comment_count` と同じ扱い）。
+ 
+-コメント投票も投稿投票と同じ順序で競合に備えます。新しい票は先に `flush` して一意インデックスで重なりを判定し、並行した同じ票の片方はスコアを加算せず現在のコメントを返します。スコアそのものは `Comment.score + diff` と DB 側で差分加算するため、別々の利用者が同時に投票しても更新が失われません。
++コメント投票も投稿投票と同じ順序で競合に備えます。新しい票は SAVEPOINT の中で先に `flush` して一意インデックスで重なりを判定し、並行した同じ票の片方はスコアを加算せず現在のコメントを返します。変更・取り消しでは、既存の票を `FOR UPDATE` で読んで判断が一続きになるようにします。スコアそのものは `Comment.score + diff` と DB 側で差分加算するため、別々の利用者が同時に投票しても更新が失われません。
+ 
+ ---
+ 
+diff --git a/tutorial/chapter_05a.md b/tutorial/chapter_05a.md
+index e6a594d..ab211c2 100644
+--- a/tutorial/chapter_05a.md
++++ b/tutorial/chapter_05a.md
+@@ -214,17 +214,19 @@ async def redirect_if_authenticated(
+ from fastapi import APIRouter, Depends, Query, Request, Response, Form
+ from typing import Literal
+ from fastapi.responses import HTMLResponse, RedirectResponse
+-from fastapi.templating import Jinja2Templates
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, redirect_if_authenticated
+ from app.accounts import services
+ from app.accounts.schemas import UserCreate
+ from app.auth import set_session_cookie, clear_session_cookie
+ 
++from app.templating import templates
++
+ router = APIRouter()
+-templates = Jinja2Templates(directory="templates")
+ 
+ 
+ # ----------------------------------------------------------------
+@@ -258,7 +260,7 @@ async def register(
+     # Pydantic でバリデーション
+     try:
+         data = UserCreate(username=username, email=email, password=password)
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             field = error["loc"][0]
+             errors[field] = error["msg"]
+diff --git a/tutorial/chapter_06a.md b/tutorial/chapter_06a.md
+index 3b42ee6..bc14814 100644
+--- a/tutorial/chapter_06a.md
++++ b/tutorial/chapter_06a.md
+@@ -59,6 +59,8 @@ from typing import Literal
+ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, require_auth
+ from app.communities import services
+@@ -227,7 +229,7 @@ async def create_subreddit(
+ 
+     try:
+         data = SubredditCreate(name=name, description=description or None)
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             errors[error["loc"][0]] = error["msg"]
+         return templates.TemplateResponse(
+diff --git a/tutorial/chapter_06b.md b/tutorial/chapter_06b.md
+index 789caf6..b397a19 100644
+--- a/tutorial/chapter_06b.md
++++ b/tutorial/chapter_06b.md
+@@ -13,6 +13,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
+ from sqlalchemy.ext.asyncio import AsyncSession
+ import uuid
+ 
++from pydantic import ValidationError
++
+ from app.database import get_db
+ from app.dependencies import get_current_user, require_auth
+ from app.posts import services
+@@ -75,7 +77,7 @@ async def create_post(
+             body=body if post_type == "text" else None,
+             url=url if post_type == "link" else None
+         )
+-    except Exception as e:
++    except ValidationError as e:
+         for error in e.errors():
+             field = error["loc"][0] if error["loc"] else "general"
+             errors[field] = error["msg"]
+diff --git a/tutorial/chapter_06c.md b/tutorial/chapter_06c.md
+index 1575bd1..a523dc9 100644
+--- a/tutorial/chapter_06c.md
++++ b/tutorial/chapter_06c.md
+@@ -108,31 +108,34 @@ async def delete_comment(
+     current_user=Depends(require_auth),
+     db: AsyncSession = Depends(get_db)
+ ):
+-    # subreddit_id は Referer ヘッダーから投稿ページへリダイレクト
+-    referer = request.headers.get("referer", "/")
+-
+-    # コメントを取得して subreddit_id を確認する
++    # コメントを取得して、戻り先の投稿ページを組み立てる
++    # （Referer ヘッダーは送られないことも細工されることもあるため使わない）
+     from sqlalchemy import select
+     from app.comments.models import Comment
+     from app.posts.models import Post
++    from app.communities.models import Subreddit
+ 
+     result = await db.execute(
+-        select(Comment, Post.subreddit_id)
++        select(Comment, Post.id, Post.subreddit_id, Subreddit.name)
+         .join(Post, Post.id == Comment.post_id)
++        .join(Subreddit, Subreddit.id == Post.subreddit_id)
+         .where(Comment.id == comment_id)
+     )
+     row = result.first()
+     if row is None:
+         raise HTTPException(status_code=404)
+ 
+-    comment, subreddit_id = row
++    comment, post_id, subreddit_id, subreddit_name = row
+ 
+     try:
+         await services.delete_comment(db, comment_id, current_user.id, subreddit_id)
+     except PermissionError:
+         raise HTTPException(status_code=403, detail="削除する権限がありません")
+ 
+-    return RedirectResponse(url=referer, status_code=303)
++    return RedirectResponse(
++        url=f"/r/{subreddit_name}/{post_id}",
++        status_code=303
++    )
+ 
+ 
+ # ----------------------------------------------------------------
+diff --git a/tutorial/chapter_08.md b/tutorial/chapter_08.md
+index 1cb7fc8..dcb6de7 100644
+--- a/tutorial/chapter_08.md
++++ b/tutorial/chapter_08.md
+@@ -152,7 +152,7 @@ curl -i -X POST http://localhost:8000/logout
+ ```bash
+ alembic downgrade base     # 全テーブルを削除する
+ alembic upgrade head       # もう一度すべて適用する
+-alembic current            # 0008 (head) と表示されれば最新まで適用済み
++alembic current            # 0009 (head) と表示されれば最新まで適用済み
+ ```
+ 
+ - [ ] downgrade と upgrade がエラーなく往復できる
+diff --git a/tutorial/index.md b/tutorial/index.md
+index 0f52b8e..afa3299 100644
+--- a/tutorial/index.md
++++ b/tutorial/index.md
+@@ -92,6 +92,7 @@
+ | [alembic/versions/XXXX_create_comments.py](../alembic/versions/XXXX_create_comments.py) | revision `0006` — comments テーブル |
+ | [alembic/versions/XXXX_create_votes.py](../alembic/versions/XXXX_create_votes.py) | revision `0007` — votes テーブル |
+ | [alembic/versions/XXXX_create_reports.py](../alembic/versions/XXXX_create_reports.py) | revision `0008` — reports テーブル |
++| [alembic/versions/XXXX_add_case_insensitive_unique_indexes.py](../alembic/versions/XXXX_add_case_insensitive_unique_indexes.py) | revision `0009` — 大文字小文字を区別しない一意インデックス（方式B） |
+ 
+ ---
+ 
+@@ -125,13 +126,13 @@
+ ```
+ チュートリアル  17ファイル
+ Python コード   24ファイル
+-Alembic          9ファイル
++Alembic          10ファイル
+ テンプレート    18ファイル
+ ─────────────────────────
+-合計            68ファイル
++合計            69ファイル
+ ```
+ 
+-※ 上の内訳68ファイルに、この index.md 自身と、設定ファイル3件（`requirements.txt`・`.env`・`.gitignore`）を加えると、全72ファイルになります。
+-※ 全コード付録の4ファイル（appendix_code_01〜04）は、上のコード54ファイルの「再録」です。二重に数えることを避けるため、上の内訳には含めていません。ファイルの実数としては、tutorial フォルダにこの4ファイルが加わり、全76ファイル（72＋4）になります。
++※ 上の内訳69ファイルに、この index.md 自身と、設定ファイル3件（`requirements.txt`・`.env`・`.gitignore`）を加えると、全73ファイルになります。
++※ 全コード付録の4ファイル（appendix_code_01〜04）は、上のコード55ファイルの「再録」です。二重に数えることを避けるため、上の内訳には含めていません。ファイルの実数としては、tutorial フォルダにこの4ファイルが加わり、全77ファイル（73＋4）になります。
+ ※ `static/.gitkeep` は、Git で空の `static/` を残すための目印ファイルです。アプリ本体や教材のファイルではないため、上のファイル数には含めていません。`static/css/` も空のディレクトリのため数えていません（CSS は CDN の Tailwind を使います）。
+ ※ `__pycache__/` などの実行時生成物は数えていません。
