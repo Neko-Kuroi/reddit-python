@@ -1,0 +1,60 @@
+<!-- templates/accounts/profile.html -->
+{% extends "base.html" %}
+{% from "components/post_card.html" import post_card %}
+
+{% block title %}u/{{ profile_user.username }} · reddit_clone{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto px-4 py-6">
+
+  <!-- ユーザー情報 -->
+  <div class="bg-white border border-gray-200 rounded p-6 mb-4">
+    <h1 class="text-2xl font-bold text-gray-900">
+      u/{{ profile_user.username }}
+    </h1>
+    <p class="text-sm text-gray-400 mt-1">
+      {{ profile_user.inserted_at.year }}年{{ profile_user.inserted_at.month }}月に登録
+    </p>
+
+    <!-- Karma -->
+    <div class="flex gap-6 mt-4 pt-4 border-t border-gray-100">
+      <div class="text-center">
+        <p class="text-xl font-bold text-gray-800">
+          {{ profile_user.post_karma | format_karma }}
+        </p>
+        <p class="text-xs text-gray-400">Post Karma</p>
+      </div>
+      <div class="text-center">
+        <p class="text-xl font-bold text-gray-800">
+          {{ profile_user.comment_karma | format_karma }}
+        </p>
+        <p class="text-xs text-gray-400">Comment Karma</p>
+      </div>
+      <div class="text-center">
+        <p class="text-xl font-bold text-gray-800">
+          {{ (profile_user.post_karma + profile_user.comment_karma) | format_karma }}
+        </p>
+        <p class="text-xs text-gray-400">合計 Karma</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 投稿一覧 -->
+  <h2 class="text-sm font-bold text-gray-500 uppercase mb-3">投稿</h2>
+
+  {% if posts %}
+    {% for post in posts %}
+      {{ post_card(post, current_user, show_subreddit=True) }}
+    {% endfor %}
+  {% else %}
+    <div class="bg-white border border-gray-200 rounded p-8 text-center">
+      <p class="text-gray-400 text-sm">まだ投稿がありません</p>
+    </div>
+  {% endif %}
+
+</div>
+
+<!-- 報告モーダル -->
+{% include "components/report_modal.html" %}
+
+{% endblock %}

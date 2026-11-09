@@ -1,0 +1,85 @@
+<!-- templates/posts/home.html -->
+{% extends "base.html" %}
+{% from "components/post_card.html" import post_card %}
+
+{% block title %}ホーム · reddit_clone{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto px-4 py-4 flex gap-4">
+
+  <!-- 左サイドバー -->
+  <div class="w-48 shrink-0">
+    <div class="bg-white border border-gray-200 rounded p-3">
+      <h2 class="text-xs font-bold text-gray-500 uppercase mb-2">参加中</h2>
+
+      {% if joined_subreddits %}
+        {% for subreddit in joined_subreddits %}
+          <a href="/r/{{ subreddit.name }}"
+            class="block text-sm py-1 hover:text-blue-500 truncate">
+            r/{{ subreddit.name }}
+          </a>
+        {% endfor %}
+      {% else %}
+        <p class="text-xs text-gray-400">まだ参加していません</p>
+      {% endif %}
+
+      <div class="border-t border-gray-100 mt-3 pt-3">
+        <a href="/subreddits/new"
+          class="text-sm text-blue-500 hover:underline">
+          ＋ コミュニティを作成
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- メインカラム -->
+  <div class="flex-1">
+
+    <!-- ソートタブ -->
+    <div class="bg-white border border-gray-200 rounded p-2 mb-4 flex gap-2">
+      <a href="/?sort=hot"
+        class="{{ 'px-4 py-1 rounded bg-gray-200 font-bold text-sm' if sort == 'hot'
+                  else 'px-4 py-1 rounded hover:bg-gray-100 text-sm text-gray-600' }}">
+        🔥 Hot
+      </a>
+      <a href="/?sort=new"
+        class="{{ 'px-4 py-1 rounded bg-gray-200 font-bold text-sm' if sort == 'new'
+                  else 'px-4 py-1 rounded hover:bg-gray-100 text-sm text-gray-600' }}">
+        ✨ New
+      </a>
+    </div>
+
+    <!-- 投稿一覧 -->
+    {% if posts %}
+      {% for post in posts %}
+        {{ post_card(post, current_user, show_subreddit=True) }}
+      {% endfor %}
+
+      {% if has_more %}
+        <div class="text-center py-4">
+          <a href="/?sort={{ sort }}&page={{ page + 1 }}"
+            class="px-6 py-2 border border-gray-300 rounded text-sm text-gray-600 hover:bg-gray-50">
+            もっと見る
+          </a>
+        </div>
+      {% endif %}
+
+    {% else %}
+      <div class="bg-white border border-gray-200 rounded p-8 text-center">
+        <p class="text-gray-500 mb-2">まだ投稿がありません</p>
+        <p class="text-sm text-gray-400">コミュニティに参加して投稿を見てみましょう</p>
+        <a href="/subreddits/new"
+          class="inline-block mt-4 px-4 py-2 bg-blue-500 text-white text-sm
+                 rounded hover:bg-blue-600">
+          コミュニティを作成
+        </a>
+      </div>
+    {% endif %}
+
+  </div>
+</div>
+
+<!-- 報告モーダル -->
+{% include "components/report_modal.html" %}
+
+{% endblock %}

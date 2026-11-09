@@ -1,0 +1,78 @@
+<!-- templates/components/post_card.html -->
+{% macro post_card(post, current_user, show_subreddit=True) %}
+<div class="bg-white border border-gray-200 rounded hover:border-gray-400 mb-2 flex">
+
+  <!-- 投票エリア -->
+  <div class="bg-gray-50 w-10 flex flex-col items-center py-2 gap-1 rounded-l"
+    id="post-vote-{{ post.id }}">
+    <button
+      hx-post="/posts/{{ post.id }}/vote"
+      hx-vals='{"value": 1}'
+      hx-target="#post-vote-{{ post.id }}"
+      hx-swap="innerHTML"
+      class="text-gray-400 hover:text-orange-500"
+    >▲</button>
+    <span class="text-xs font-bold text-gray-700">{{ post.score }}</span>
+    <button
+      hx-post="/posts/{{ post.id }}/vote"
+      hx-vals='{"value": -1}'
+      hx-target="#post-vote-{{ post.id }}"
+      hx-swap="innerHTML"
+      class="text-gray-400 hover:text-blue-500"
+    >▼</button>
+  </div>
+
+  <!-- 投稿内容 -->
+  <div class="p-2 flex-1">
+
+    <div class="flex items-start gap-2">
+      <a href="/r/{{ post.subreddit.name }}/{{ post.id }}"
+        class="text-sm font-medium text-gray-900 hover:underline flex-1">
+        {{ post.title }}
+      </a>
+
+      {% if post.type == "link" %}
+        <a href="{{ post.url }}" target="_blank" rel="noopener noreferrer"
+          class="text-xs text-blue-500 hover:underline whitespace-nowrap">
+          {{ post.url | urlparse_host }} ↗
+        </a>
+      {% else %}
+        <span class="text-xs text-gray-400">text</span>
+      {% endif %}
+    </div>
+
+    <div class="flex items-center gap-2 mt-1 text-xs text-gray-500">
+      {% if show_subreddit %}
+        <a href="/r/{{ post.subreddit.name }}" class="font-medium hover:underline">
+          r/{{ post.subreddit.name }}
+        </a>
+        <span>•</span>
+      {% endif %}
+      <span>
+        投稿者
+        <a href="/u/{{ post.author.username }}" class="hover:underline">
+          u/{{ post.author.username }}
+        </a>
+      </span>
+      <span>•</span>
+      <span>{{ post.inserted_at | time_ago }}</span>
+    </div>
+
+    <div class="mt-1 flex items-center gap-2">
+      <a href="/r/{{ post.subreddit.name }}/{{ post.id }}"
+        class="text-xs text-gray-500 hover:bg-gray-100 px-1 py-0.5 rounded">
+        💬 {{ post.comment_count }} コメント
+      </a>
+
+      {% if current_user and current_user.id != post.author_id %}
+        <button
+          onclick="openReportModal('post', '{{ post.id }}')"
+          class="text-xs text-gray-400 hover:text-gray-600">
+          報告
+        </button>
+      {% endif %}
+    </div>
+
+  </div>
+</div>
+{% endmacro %}

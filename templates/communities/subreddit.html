@@ -1,0 +1,63 @@
+<!-- templates/communities/subreddit.html -->
+{% extends "base.html" %}
+{% from "components/post_card.html" import post_card %}
+
+{% block title %}r/{{ subreddit.name }} · reddit_clone{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto px-4 py-4 flex gap-4">
+
+  <!-- メインカラム -->
+  <div class="flex-1">
+
+    <!-- ソートタブ -->
+    <div class="bg-white border border-gray-200 rounded p-2 mb-4 flex gap-2">
+      <a href="/r/{{ subreddit.name }}?sort=hot"
+        class="{{ 'px-4 py-1 rounded bg-gray-200 font-bold text-sm' if sort == 'hot'
+                  else 'px-4 py-1 rounded hover:bg-gray-100 text-sm text-gray-600' }}">
+        🔥 Hot
+      </a>
+      <a href="/r/{{ subreddit.name }}?sort=new"
+        class="{{ 'px-4 py-1 rounded bg-gray-200 font-bold text-sm' if sort == 'new'
+                  else 'px-4 py-1 rounded hover:bg-gray-100 text-sm text-gray-600' }}">
+        ✨ New
+      </a>
+    </div>
+
+    <!-- 投稿一覧 -->
+    <div id="post-list">
+      {% include "components/post_list.html" %}
+    </div>
+
+  </div>
+
+  <!-- サイドバー -->
+  <div class="w-72 shrink-0">
+    <div class="bg-white border border-gray-200 rounded p-4">
+      <h2 class="font-bold text-lg mb-2">r/{{ subreddit.name }}</h2>
+
+      {% if subreddit.description %}
+        <p class="text-sm text-gray-600 mb-4">{{ subreddit.description }}</p>
+      {% endif %}
+
+      <!-- Join / Leave ボタン -->
+      {% if current_user %}
+        <div id="join-button">
+          {% include "components/join_button.html" %}
+        </div>
+
+        <a href="/r/{{ subreddit.name }}/submit"
+          class="block w-full mt-2 border border-gray-300 text-center
+                 rounded-full py-1 text-sm hover:bg-gray-50">
+          投稿する
+        </a>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+<!-- 報告モーダル -->
+{% include "components/report_modal.html" %}
+
+{% endblock %}

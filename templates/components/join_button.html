@@ -1,0 +1,22 @@
+<!-- templates/components/join_button.html -->
+{% if joined %}
+  <button
+    hx-post="/r/{{ subreddit.name }}/leave"
+    hx-target="#join-button"
+    hx-swap="innerHTML"
+    class="w-full border border-blue-500 text-blue-500 rounded-full
+           py-1 text-sm hover:bg-blue-50"
+  >
+    参加中
+  </button>
+{% else %}
+  <button
+    hx-post="/r/{{ subreddit.name }}/join"
+    hx-target="#join-button"
+    hx-swap="innerHTML"
+    class="w-full bg-blue-500 text-white rounded-full
+           py-1 text-sm hover:bg-blue-600"
+  >
+    参加する
+  </button>
+{% endif %}

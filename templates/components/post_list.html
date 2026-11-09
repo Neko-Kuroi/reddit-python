@@ -1,0 +1,23 @@
+<!-- templates/components/post_list.html -->
+{% from "components/post_card.html" import post_card %}
+
+{% if posts %}
+  {% for post in posts %}
+    {{ post_card(post, current_user, show_subreddit=False) }}
+  {% endfor %}
+
+  {% if has_more %}
+    <div class="text-center py-4"
+      hx-get="/r/{{ subreddit.name }}/posts?sort={{ sort }}&page={{ page + 1 }}"
+      hx-trigger="revealed"
+      hx-target="this"
+      hx-swap="outerHTML"
+    >
+      <button class="px-6 py-2 border border-gray-300 rounded text-sm text-gray-600 hover:bg-gray-50">
+        もっと見る
+      </button>
+    </div>
+  {% endif %}
+{% else %}
+  <p class="text-gray-500 text-center py-8">まだ投稿がありません</p>
+{% endif %}

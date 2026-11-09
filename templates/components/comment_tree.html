@@ -1,0 +1,108 @@
+<!-- templates/components/comment_tree.html -->
+{% macro comment_tree(comment, current_user, subreddit_id, depth=0) %}
+<div class="mb-2 {% if depth > 0 %}border-l border-gray-200 pl-3{% endif %}">
+
+  <div class="flex gap-2">
+
+    <!-- 投票ボタン -->
+    <div id="comment-vote-{{ comment.id }}"
+      class="flex flex-col items-center gap-0.5 pt-1 shrink-0">
+      <button
+        hx-post="/comments/{{ comment.id }}/vote"
+        hx-vals='{"value": 1}'
+        hx-target="#comment-vote-{{ comment.id }}"
+        hx-swap="innerHTML"
+        class="text-gray-300 hover:text-orange-500 text-xs"
+      >▲</button>
+      <span class="text-xs text-gray-500">{{ comment.score }}</span>
+      <button
+        hx-post="/comments/{{ comment.id }}/vote"
+        hx-vals='{"value": -1}'
+        hx-target="#comment-vote-{{ comment.id }}"
+        hx-swap="innerHTML"
+        class="text-gray-300 hover:text-blue-500 text-xs"
+      >▼</button>
+    </div>
+
+    <!-- コメント内容 -->
+    <div class="flex-1 border-l-2 border-gray-100 pl-2">
+      <div class="text-xs text-gray-500 mb-1">
+        <span class="font-medium text-gray-700">
+          u/{{ comment.author.username }}
+        </span>
+        • {{ comment.inserted_at | time_ago }}
+        • {{ comment.score }} ポイント
+      </div>
+
+      <p class="text-sm text-gray-800 whitespace-pre-wrap">{{ comment.body }}</p>
+
+      <div class="flex gap-3 mt-1">
+
+        {% if current_user %}
+          <!-- 返信フォーム（クリックでトグル） -->
+          <button
+            onclick="toggleReplyForm('{{ comment.id }}')"
+            class="text-xs text-gray-400 hover:text-gray-600"
+          >返信</button>
+        {% endif %}
+
+        {% if current_user and current_user.id == comment.author_id %}
+          <form action="/comments/{{ comment.id }}/delete" method="post" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf_token', '') }}" />
+            <button type="submit"
+              onclick="return confirm('このコメントを削除しますか？')"
+              class="text-xs text-red-400 hover:text-red-600">
+              削除
+            </button>
+          </form>
+        {% endif %}
+
+        {% if current_user and current_user.id != comment.author_id %}
+          <button
+            onclick="openReportModal('comment', '{{ comment.id }}')"
+            class="text-xs text-gray-400 hover:text-gray-600">
+            報告
+          </button>
+        {% endif %}
+      </div>
+
+      <!-- 返信フォーム（デフォルト非表示） -->
+      {% if current_user %}
+        <div id="reply-form-{{ comment.id }}" class="hidden mt-2">
+          <form action="/posts/{{ comment.post_id }}/comments" method="post">
+            <input type="hidden" name="csrf_token" value="{{ request.cookies.get('csrf_token', '') }}" />
+            <input type="hidden" name="parent_id" value="{{ comment.id }}" />
+            <textarea name="body" rows="3"
+              placeholder="返信を入力..."
+              class="w-full border border-gray-300 rounded p-2 text-xs
+                     resize-none focus:outline-none focus:border-blue-400"
+            ></textarea>
+            <div class="flex gap-2 mt-1 justify-end">
+              <button type="button"
+                onclick="toggleReplyForm('{{ comment.id }}')"
+                class="text-xs text-gray-500 px-2 py-1">
+                キャンセル
+              </button>
+              <button type="submit"
+                class="text-xs bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">
+                返信する
+              </button>
+            </div>
+          </form>
+        </div>
+      {% endif %}
+
+    </div>
+  </div>
+
+  <!-- 子コメント（再帰）-->
+  {% if comment.children and depth < 8 %}
+    <div class="ml-4 mt-2">
+      {% for child in comment.children %}
+        {{ comment_tree(child, current_user, subreddit_id, depth + 1) }}
+      {% endfor %}
+    </div>
+  {% endif %}
+
+</div>
+{% endmacro %}

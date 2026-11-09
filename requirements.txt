@@ -1,0 +1,29 @@
+# requirements.txt
+
+# FastAPI 本体
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+
+# テンプレートエンジン
+jinja2==3.1.4
+python-multipart==0.0.9
+
+# DB
+sqlalchemy==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+
+# バリデーション
+pydantic==2.9.0
+pydantic-settings==2.5.2
+# EmailStr（第3章の UserCreate）を使うために必要
+email-validator==2.3.0
+
+# 認証
+passlib[bcrypt]==1.7.4
+# passlib 1.7.4 は bcrypt 4.1 以降と組み合わせると動作しないため版を固定する
+bcrypt==4.0.1
+itsdangerous==2.2.0
+
+# 環境変数
+python-dotenv==1.0.1
